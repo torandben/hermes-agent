@@ -111,6 +111,228 @@ class TestCodexAppServerModule:
         assert "-32600" in str(err)
 
 
+class TestCodexExecutableResolution:
+    @staticmethod
+    def _capture_spawn(
+        monkeypatch,
+        *,
+        codex_bin: str,
+        resolved: str | None = None,
+        which=None,
+        env: dict[str, str] | None = None,
+        captured: dict | None = None,
+    ):
+        import subprocess
+        from agent.transports import codex_app_server as cas
+        from hermes_cli import _subprocess_compat
+
+        captured = {} if captured is None else captured
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setattr(
+            _subprocess_compat.shutil,
+            "which",
+            which or (lambda cmd, mode=0, path=None: resolved),
+        )
+
+        client = cas.CodexAppServerClient(codex_bin=codex_bin, env=env)
+        client._closed = True
+        return captured["cmd"]
+
+    def test_spawn_resolves_codex_on_child_spawn_path(self, monkeypatch) -> None:
+        import os
+
+        child_path = os.pathsep.join(["child-bin", "child-npm"])
+        resolved = os.path.join("child-bin", "codex.exe")
+        seen_paths = []
+
+        def fake_which(cmd, mode=0, path=None):
+            if cmd != "codex":
+                return None
+            seen_paths.append(path)
+            return resolved if path == child_path else None
+
+        cmd = self._capture_spawn(
+            monkeypatch,
+            codex_bin="codex",
+            which=fake_which,
+            env={"PATH": child_path},
+        )
+
+        assert seen_paths == [child_path]
+        assert cmd[:2] == [resolved, "app-server"]
+
+    def test_spawn_falls_back_to_bare_codex_when_unresolved(self, monkeypatch) -> None:
+        cmd = self._capture_spawn(
+            monkeypatch,
+            codex_bin="codex",
+            resolved=None,
+        )
+
+        assert cmd[:2] == ["codex", "app-server"]
+
+    @pytest.mark.parametrize(
+        "which_suffix",
+        [None, ".CMD"],
+        ids=["which-finds-nothing", "which-rewrites-via-pathext"],
+    )
+    def test_spawn_preserves_explicit_executable_path(
+        self, monkeypatch, which_suffix
+    ) -> None:
+        import os
+
+        explicit = os.path.abspath(os.path.join("tools", "codex", "codex"))
+
+        cmd = self._capture_spawn(
+            monkeypatch,
+            codex_bin=explicit,
+            resolved=None if which_suffix is None else explicit + which_suffix,
+        )
+
+        assert cmd[:2] == [explicit, "app-server"]
+
+    def test_spawn_resolves_npm_cmd_to_shell_free_node_launcher(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        import json
+        from hermes_cli import _subprocess_compat
+
+        npm_root = tmp_path / "npm"
+        package_root = npm_root / "node_modules" / "@openai" / "codex"
+        entrypoint = package_root / "bin" / "codex.js"
+        entrypoint.parent.mkdir(parents=True)
+        entrypoint.write_text("// fixture", encoding="utf-8")
+        (package_root / "package.json").write_text(
+            json.dumps({"bin": {"codex": "bin/codex.js"}}), encoding="utf-8"
+        )
+        shim = npm_root / "codex.CMD"
+        shim.write_text("@echo off", encoding="utf-8")
+        node = tmp_path / "node.exe"
+        node.write_bytes(b"")
+
+        def fake_which(cmd, mode=0, path=None):
+            return str(shim) if cmd == "codex" else str(node) if cmd == "node" else None
+
+        monkeypatch.setattr(_subprocess_compat, "IS_WINDOWS", True)
+        cmd = self._capture_spawn(
+            monkeypatch,
+            codex_bin="codex",
+            which=fake_which,
+            env={"PATH": str(tmp_path)},
+        )
+
+        assert cmd == [str(node), str(entrypoint.resolve()), "app-server"]
+        assert all("cmd.exe" not in part.lower() for part in cmd)
+        assert not cmd[0].lower().endswith((".cmd", ".bat"))
+
+    def test_spawn_refuses_non_npm_windows_batch_shim(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from hermes_cli import _subprocess_compat
+
+        shim = tmp_path / "codex.cmd"
+        shim.write_text("@echo off", encoding="utf-8")
+        captured = {}
+        monkeypatch.setattr(_subprocess_compat, "IS_WINDOWS", True)
+
+        with pytest.raises(OSError) as excinfo:
+            self._capture_spawn(
+                monkeypatch,
+                codex_bin="codex",
+                resolved=str(shim),
+                captured=captured,
+            )
+
+        assert "cmd" not in captured
+        assert "npm Codex package" in str(excinfo.value)
+
+    def test_spawn_rejects_non_mapping_npm_manifest(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from hermes_cli import _subprocess_compat
+
+        npm_root = tmp_path / "npm"
+        package_root = npm_root / "node_modules" / "@openai" / "codex"
+        package_root.mkdir(parents=True)
+        (package_root / "package.json").write_text("[]", encoding="utf-8")
+        shim = npm_root / "codex.cmd"
+        shim.write_text("@echo off", encoding="utf-8")
+        monkeypatch.setattr(_subprocess_compat, "IS_WINDOWS", True)
+
+        with pytest.raises(OSError, match="npm Codex package"):
+            self._capture_spawn(
+                monkeypatch,
+                codex_bin="codex",
+                resolved=str(shim),
+            )
+
+    def test_preflight_uses_same_shell_free_node_launcher(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        import json
+        import subprocess
+        from agent.transports import codex_app_server as cas
+        from hermes_cli import _subprocess_compat
+
+        npm_root = tmp_path / "npm"
+        package_root = npm_root / "node_modules" / "@openai" / "codex"
+        entrypoint = package_root / "bin" / "codex.js"
+        entrypoint.parent.mkdir(parents=True)
+        entrypoint.write_text("// fixture", encoding="utf-8")
+        (package_root / "package.json").write_text(
+            json.dumps({"bin": {"codex": "bin/codex.js"}}), encoding="utf-8"
+        )
+        shim = npm_root / "codex.cmd"
+        shim.write_text("@echo off", encoding="utf-8")
+        node = tmp_path / "node.exe"
+        node.write_bytes(b"")
+        captured = {}
+
+        def fake_which(name, mode=0, path=None):
+            return str(shim) if name == "codex" else str(node) if name == "node" else None
+
+        def fake_run(cmd, *args, **kwargs):
+            captured["cmd"] = list(cmd)
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="codex-cli 0.130.0\n", stderr=""
+            )
+
+        monkeypatch.setattr(_subprocess_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(_subprocess_compat.shutil, "which", fake_which)
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        ok, version = cas.check_codex_binary()
+
+        assert ok is True
+        assert version == "0.130.0"
+        assert captured["cmd"] == [
+            str(node),
+            str(entrypoint.resolve()),
+            "--version",
+        ]
+
+
 class TestSpawnEnvIsolation:
     """The codex spawn must NOT rewrite HOME — codex's shell tool spawns
     subprocesses (gh, git, npm, aws, gcloud, ...) that need to find their
@@ -249,6 +471,10 @@ class TestSpawnEnvIsolation:
         monkeypatch.setenv(
             "HERMES_KANBAN_DB",
             "/users/alice/.hermes/kanban/boards/smoke/kanban.db",
+        )
+        monkeypatch.setattr(
+            "hermes_cli._subprocess_compat.shutil.which",
+            lambda cmd, mode=0, path=None: None,
         )
 
         client = cas.CodexAppServerClient(codex_bin="codex")

@@ -36,6 +36,10 @@ from typing import Mapping, Sequence
 
 __all__ = [
     "IS_WINDOWS",
+    "WindowsBatchShimError",
+    "is_windows_batch_file",
+    "resolve_executable_path",
+    "resolve_executable_command",
     "resolve_node_command",
     "split_command_line",
     "suppress_platform_ver_console",
@@ -102,8 +106,13 @@ def resolve_node_command(name: str, argv: Sequence[str]) -> list[str]:
     because CreateProcessW doesn't execute batch files directly.
 
     ``shutil.which(name)`` *does* resolve ``.cmd`` via PATHEXT and returns
-    the fully-qualified path — which CreateProcessW accepts because the
-    extension tells Windows to route through ``cmd.exe /c``.
+    the fully-qualified path, which CreateProcessW launches by routing it
+    through ``cmd.exe /c``.  That is **not** shell-free: cmd.exe re-parses
+    the arguments (``%VAR%`` expansion, ``&``/``|`` after an embedded
+    ``"``) with no escaping from Python, even with ``shell=False``.  Only
+    pass fixed, trusted argv here; for argv that carries paths, config
+    values or caller input use :func:`resolve_executable_command`, which
+    refuses batch shims.
 
     On POSIX ``shutil.which`` also returns a fully-qualified path when
     found.  That's a small change from bare-name resolution (the OS does
@@ -111,8 +120,7 @@ def resolve_node_command(name: str, argv: Sequence[str]) -> list[str]:
     benefit of making the argv reproducible in logs.
 
     Behavior when the command is not on PATH:
-    - On Windows: return the bare name — caller can still try with
-      ``shell=True`` as a last resort, OR the subsequent Popen will
+    - On Windows: return the bare name — the subsequent Popen will
       raise FileNotFoundError with a readable error we want to surface.
     - On POSIX: same.  Bare ``npm`` on a Linux box without npm installed
       fails the same way it did before this function existed.
@@ -129,6 +137,67 @@ def resolve_node_command(name: str, argv: Sequence[str]) -> list[str]:
     if resolved:
         return [resolved, *argv]
     return [name, *argv]
+
+
+class WindowsBatchShimError(OSError):
+    """Refused to launch a Windows ``.cmd``/``.bat`` file as a plain process."""
+
+
+def is_windows_batch_file(path: str) -> bool:
+    """Return whether *path* names a Windows ``.cmd``/``.bat`` shim."""
+    # Windows drops trailing dots/spaces when opening a file, so
+    # "codex.cmd " still runs as a batch file.
+    return os.path.splitext(path.rstrip(". "))[1].lower() in (".bat", ".cmd")
+
+
+def resolve_executable_path(
+    name: str,
+    *,
+    env: "Mapping[str, str] | None" = None,
+) -> str:
+    """Resolve *name* against the PATH used by a child spawned with *env*."""
+    if os.path.dirname(name):
+        return name
+    path = os.pathsep.join(os.get_exec_path(env))
+    return shutil.which(name, path=path) or name
+
+
+def resolve_executable_command(
+    name: str,
+    argv: Sequence[str],
+    *,
+    env: "Mapping[str, str] | None" = None,
+) -> list[str]:
+    """Resolve *name* against the PATH the child will be spawned with.
+
+    ``subprocess`` given ``env=`` searches the *child's* PATH, while
+    :func:`resolve_node_command` searches the parent's ``os.environ``; when
+    the two differ, the resolved argv[0] is not what the spawn would run.
+    ``os.get_exec_path(env)`` is the PATH list POSIX ``subprocess`` itself
+    searches for an ``env=`` child.
+
+    An unresolved name is returned bare, so the spawn still raises
+    ``FileNotFoundError`` for a missing binary.  A name with a directory
+    part is an explicit path and is kept verbatim: ``shutil.which`` would
+    otherwise apply PATHEXT and could swap ``C:\\tools\\codex`` for a
+    sibling ``codex.cmd``.
+
+    On Windows a ``.cmd``/``.bat`` result raises :class:`WindowsBatchShimError`
+    instead of being returned.  CreateProcess runs batch files through
+    ``cmd.exe`` even with ``shell=False``, and cmd.exe re-parses argv as
+    shell syntax without any escaping from Python, so argv holding paths or
+    caller input would become command injection.  There is no safe quoting
+    for cmd.exe; the caller needs a native executable instead.
+    """
+    resolved = resolve_executable_path(name, env=env)
+    if IS_WINDOWS and is_windows_batch_file(resolved):
+        raise WindowsBatchShimError(
+            f"refusing to launch Windows batch shim {resolved!r}: CreateProcess "
+            "runs .cmd/.bat files through cmd.exe, which re-parses the "
+            "arguments as shell syntax. Put a native .exe ahead of it on PATH, "
+            "or pass the .exe's full path."
+        )
+    return [resolved, *argv]
 
 
 # -----------------------------------------------------------------------------

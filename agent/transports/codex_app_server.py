@@ -23,13 +23,74 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
+from hermes_cli import _subprocess_compat
+from hermes_cli._subprocess_compat import (
+    WindowsBatchShimError,
+    windows_hide_flags,
+)
 from tools.environments.local import hermes_subprocess_env
 
 # Default minimum codex version we test against. The PR sets this from the
 # `codex --version` parsed at install time; bumping is a one-line change here.
 MIN_CODEX_VERSION = (0, 125, 0)
+
+
+def resolve_codex_command(
+    codex_bin: str,
+    argv: list[str],
+    *,
+    env: Optional[dict[str, str]] = None,
+) -> list[str]:
+    """Build a shell-free Codex argv, including npm installs on Windows.
+
+    Python cannot safely preserve argv boundaries when Windows launches a
+    ``.cmd``/``.bat`` shim.  For the standard npm Codex shim, invoke the
+    package's declared JavaScript entrypoint with a native ``node.exe``
+    instead.  The upstream launcher then locates and execs the platform's
+    native Codex binary without involving ``cmd.exe``.
+    """
+    resolved = _subprocess_compat.resolve_executable_path(codex_bin, env=env)
+    if not (
+        _subprocess_compat.IS_WINDOWS
+        and _subprocess_compat.is_windows_batch_file(resolved)
+    ):
+        return [resolved, *argv]
+
+    shim_path = Path(resolved.rstrip(". "))
+    package_root = shim_path.parent / "node_modules" / "@openai" / "codex"
+    manifest_path = package_root / "package.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("package.json root is not an object")
+        bin_spec = manifest.get("bin")
+        entry_rel = (
+            bin_spec
+            if isinstance(bin_spec, str)
+            else bin_spec.get("codex")
+            if isinstance(bin_spec, dict)
+            else None
+        )
+        if not isinstance(entry_rel, str) or not entry_rel:
+            raise ValueError("package.json has no codex bin entry")
+        package_root_real = package_root.resolve(strict=True)
+        entrypoint = (package_root_real / entry_rel).resolve(strict=True)
+        entrypoint.relative_to(package_root_real)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise WindowsBatchShimError(
+            f"refusing to launch Windows batch shim {resolved!r}: no valid "
+            "npm Codex package entrypoint was found beside it"
+        ) from exc
+
+    adjacent_node = shim_path.parent / "node.exe"
+    if adjacent_node.is_file():
+        return [str(adjacent_node), str(entrypoint), *argv]
+    return _subprocess_compat.resolve_executable_command(
+        "node", [str(entrypoint), *argv], env=env
+    )
 
 
 @dataclass
@@ -123,14 +184,14 @@ class CodexAppServerClient:
                 ]
             )
 
-        cmd = [codex_bin, "app-server"] + app_server_args
+        cmd = resolve_codex_command(
+            codex_bin, ["app-server", *app_server_args], env=spawn_env
+        )
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
 
         # Hide the console the codex child would otherwise flash on Windows
         # (#56747). Hide-only — stdio pipes stay intact for the app-server wire.
-        from hermes_cli._subprocess_compat import windows_hide_flags
-
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -390,17 +451,20 @@ def check_codex_binary(
     """Verify codex CLI is installed and meets minimum version.
 
     Returns (ok, message). Used by setup wizard and runtime startup."""
+    probe_env = hermes_subprocess_env(inherit_credentials=True)
     try:
         proc = subprocess.run(
-            [codex_bin, "--version"],
+            resolve_codex_command(codex_bin, ["--version"], env=probe_env),
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
             timeout=10,
             stdin=subprocess.DEVNULL,
+            env=probe_env,
+            creationflags=windows_hide_flags(),
         )
-    except FileNotFoundError:
+    except (FileNotFoundError, WindowsBatchShimError) as exc:
         return False, (
-            f"codex CLI not found at {codex_bin!r}. Install with: "
+            f"codex CLI not found at {codex_bin!r}: {exc}. Install with: "
             f"npm i -g @openai/codex"
         )
     except subprocess.TimeoutExpired:
