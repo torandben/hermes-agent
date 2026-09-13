@@ -374,6 +374,50 @@ _CODEX_TOOL_ITEM_TYPES = frozenset(
 _INTERNAL_MCP_SERVER = "hermes-tools"
 
 
+# Codex-side failures that are user-actionable auth problems, not provider
+# capacity. These must never burn a fallback attempt — switching providers
+# cannot fix a missing `codex login`, and doing so would mask the real hint.
+_CODEX_NON_FALLBACK_MARKERS = (
+    "codex login",
+    "not logged in",
+    "no auth",
+)
+
+
+def codex_turn_error_should_fallback(error) -> bool:
+    """True when a codex app-server turn error warrants the fallback chain.
+
+    The codex_app_server runtime hands the whole turn to a subprocess and
+    reports provider failures as a ``TurnResult.error`` string on a normally
+    shaped result dict, rather than raising. Because
+    ``agent/conversation_loop.py`` dispatches this runtime with an early
+    ``return`` placed *before* the retry/fallback loop, nothing on the path
+    ever consulted the configured fallback chain — a Codex quota exhaustion
+    dead-ended the turn instead of failing over (live incident 2026-09-13:
+    the Telegram bot went down while ``fallback_providers`` sat unused).
+
+    Reuse the shared classifier rather than pattern-matching here, so the
+    codex path agrees with every other provider path about what "rate
+    limited" or "out of credits" means.
+    """
+    text = (error or "")
+    text = text.strip() if isinstance(text, str) else ""
+    if not text:
+        return False
+    lowered = text.lower()
+    if any(marker in lowered for marker in _CODEX_NON_FALLBACK_MARKERS):
+        return False
+    try:
+        from agent.error_classifier import classify_api_error
+
+        verdict = classify_api_error(Exception(text), provider="openai-codex")
+    except Exception:  # pragma: no cover - classifier must never break a turn
+        logger.debug("codex turn-error classification failed", exc_info=True)
+        return False
+    return bool(getattr(verdict, "should_fallback", False))
+
+
+
 def _codex_item_to_tool_name(item: dict) -> str:
     """Synthetic Hermes tool name for a codex item. Mirrors
     CodexEventProjector so the progress bubble and the projected
@@ -809,6 +853,9 @@ def run_codex_app_server_turn(
                 else {}
             ),
             "error": str(exc),
+            # Same rationale as the normal-return path below: a crash carrying
+            # a quota/rate-limit signal must be routable to the fallback chain.
+            "should_fallback": codex_turn_error_should_fallback(str(exc)),
         }
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
@@ -953,6 +1000,12 @@ def run_codex_app_server_turn(
             else {}
         ),
         "error": turn.error,
+        # Codex reports provider failures as a turn.error string instead of
+        # raising, and this runtime returns before conversation_loop's
+        # retry/fallback loop. Surface the classifier's verdict so the caller
+        # can route a quota/rate-limit failure to the configured fallback
+        # chain instead of dead-ending the turn (2026-09-13 incident).
+        "should_fallback": codex_turn_error_should_fallback(turn.error),
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after

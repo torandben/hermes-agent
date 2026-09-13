@@ -2082,14 +2082,68 @@ def run_conversation(
     # all run inside Codex). Default Hermes path is bypassed entirely.
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
+    # A previous turn degraded to chat_completions because Codex reported a
+    # fallback-worthy provider error (see below). That degradation is
+    # per-turn: restore the configured runtime so the next turn tries Codex
+    # again once its quota window resets, instead of silently staying on the
+    # fallback provider forever.
+    if getattr(agent, "_codex_runtime_degraded", False):
+        agent.api_mode = "codex_app_server"
+        agent._codex_runtime_degraded = False
+
     if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
+        _codex_result = agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
         )
+        # Codex reports provider failures (quota exhausted, rate limited) as an
+        # error string on a normally shaped result rather than raising, and the
+        # return above skips the retry/fallback loop below. Without this branch
+        # `fallback_providers` is silently dead for every codex_app_server user:
+        # Codex hits its usage limit and the turn dead-ends instead of failing
+        # over (2026-09-13 incident — the Telegram bot went down while a working
+        # Anthropic fallback sat unused).
+        #
+        # Degrade this turn to the standard chat_completions path so the loop
+        # below runs with the fallback chain. The codex session is already
+        # retired by the runtime on a should_retire error; drop any survivor so
+        # a later turn re-spawns cleanly rather than reusing a wedged client.
+        if isinstance(_codex_result, dict) and _codex_result.get("should_fallback"):
+            logger.warning(
+                "codex app-server turn failed with a fallback-worthy provider "
+                "error (%s); degrading this turn to the default runtime so the "
+                "configured fallback chain can serve it",
+                _codex_result.get("error"),
+            )
+            _codex_session = getattr(agent, "_codex_session", None)
+            if _codex_session is not None:
+                try:
+                    _codex_session.close()
+                except Exception:
+                    logger.debug("codex session close failed", exc_info=True)
+                agent._codex_session = None
+            agent.api_mode = "chat_completions"
+            agent._codex_runtime_degraded = True
+            # Activate the fallback provider NOW rather than letting the loop
+            # below rediscover the outage: the primary credentials still point
+            # at the exhausted Codex endpoint, so without this the turn burns
+            # its full retry budget (3 attempts + backoff, ~13s measured)
+            # against a provider we already know is down before failing over.
+            try:
+                from agent.error_classifier import FailoverReason
+
+                agent._try_activate_fallback(FailoverReason.rate_limit)
+            except Exception:
+                logger.debug(
+                    "eager fallback activation after codex degrade failed; "
+                    "the retry loop below will still fail over",
+                    exc_info=True,
+                )
+        else:
+            return _codex_result
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
