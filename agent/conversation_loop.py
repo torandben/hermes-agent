@@ -2132,9 +2132,12 @@ def run_conversation(
             # at the exhausted Codex endpoint, so without this the turn burns
             # its full retry budget (3 attempts + backoff, ~13s measured)
             # against a provider we already know is down before failing over.
+            #
+            # FailoverReason is imported at module scope on purpose — a
+            # function-local `from ... import FailoverReason` here would make
+            # the name local to this whole function and raise UnboundLocalError
+            # at every other use site on the normal error path (2026-09-13).
             try:
-                from agent.error_classifier import FailoverReason
-
                 agent._try_activate_fallback(FailoverReason.rate_limit)
             except Exception:
                 logger.debug(

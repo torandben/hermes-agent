@@ -116,6 +116,60 @@ class TestCodexRuntimeSignalsFallback:
         )
 
 
+class TestNoShadowedModuleImports:
+    """A function-local re-import must not shadow a module-level name.
+
+    Live regression (2026-09-13): the eager-fallback branch added
+    ``from agent.error_classifier import FailoverReason`` *inside*
+    ``run_conversation``. Python then treats ``FailoverReason`` as a local for
+    the WHOLE function, so every other reference to it — there are 20+, all on
+    the normal error-handling path — raised
+    ``UnboundLocalError: cannot access local variable 'FailoverReason'``
+    whenever the codex branch was not taken. Effect: Telegram answered
+    "Sorry, I encountered an unexpected error." for any turn that hit a
+    provider error, which is exactly when error handling matters most.
+    """
+
+    def test_failover_reason_is_imported_only_at_module_level(self):
+        import ast
+        import inspect
+
+        from agent import conversation_loop
+
+        tree = ast.parse(inspect.getsource(conversation_loop))
+
+        module_level = {
+            alias.name
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+        }
+        assert "FailoverReason" in module_level, (
+            "expected a module-level FailoverReason import to rely on"
+        )
+
+        # Any nested (function-scoped) import of the same name re-binds it as a
+        # local for that entire function and breaks unrelated references.
+        offenders = []
+        for func in ast.walk(tree):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(func):
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                for alias in node.names:
+                    if (alias.asname or alias.name) in module_level:
+                        offenders.append(
+                            f"{func.name}() re-imports "
+                            f"{alias.name!r} at line {node.lineno}"
+                        )
+
+        assert not offenders, (
+            "function-local imports shadow module-level names for the whole "
+            "function scope (UnboundLocalError risk): " + "; ".join(offenders)
+        )
+
+
 class TestDegradationIsPerTurn:
     """Degrading to the fallback runtime must not disable Codex permanently.
 
