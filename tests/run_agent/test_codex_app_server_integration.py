@@ -378,6 +378,34 @@ class TestRunConversationCodexPath:
 
         assert captured["cwd"] == str(tmp_path)
 
+    def test_agent_runtime_identity_seeds_codex_thread(self, monkeypatch):
+        """The app-server adapter receives the model Hermes says is active."""
+        captured: dict[str, str] = {}
+
+        def fake_init(self, **kwargs):
+            captured.update(kwargs)
+            self._thread_id = "thread-stub-1"
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+                turn_id="turn-stub-1",
+                thread_id="thread-stub-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        agent = _make_codex_agent()
+        agent.model = "gpt-5.6-terra"
+        agent.provider = "openai-codex"
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("which model is active?")
+
+        assert captured["model"] == "gpt-5.6-terra"
+        assert captured["provider"] == "openai-codex"
+
     def _capture_routing_agent(self, monkeypatch):
         """Build a codex agent with a CodexAppServerSession stub that captures
         the request_routing passed at construction time, so we can assert how

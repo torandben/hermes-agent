@@ -162,7 +162,27 @@ class TestLifecycle:
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
 
-    def test_thread_start_passes_cwd_only(self):
+    def test_thread_start_pins_model_and_runtime_identity(self):
+        """The native Codex thread must use Hermes' actual runtime identity.
+
+        Without these fields app-server silently chooses its own default model
+        and the agent cannot answer which model/provider is serving the turn.
+        """
+        client = FakeClient()
+        s = make_session(
+            client,
+            model="gpt-5.6-terra",
+            provider="openai-codex",
+        )
+        s.ensure_started()
+
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert params["model"] == "gpt-5.6-terra"
+        assert "gpt-5.6-terra" in params["developerInstructions"]
+        assert "openai-codex" in params["developerInstructions"]
+        assert "actively answering" in params["developerInstructions"]
+
+    def test_thread_start_passes_cwd_without_permissions_override(self):
         """thread/start carries cwd. We intentionally do NOT pass `permissions`
         on this codex version (experimentalApi-gated + requires matching
         config.toml [permissions] table). Letting codex use its default

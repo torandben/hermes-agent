@@ -111,6 +111,35 @@ class TestCodexAppServerModule:
         assert "-32600" in str(err)
 
 
+class TestCodexWindowsSandboxPath:
+    def test_msix_windowsapps_entries_are_removed_for_codex_child(self) -> None:
+        """Restricted Windows tokens cannot launch Store-packaged pwsh."""
+        import os
+        from agent.transports.codex_app_server import codex_sandbox_safe_path
+
+        original = os.pathsep.join(
+            [
+                r"C:\Program Files\Git\cmd",
+                r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.6.0_x64__8wekyb3d8bbwe",
+                r"C:\Users\alice\AppData\Local\Microsoft\WindowsApps",
+                r"C:\Windows\System32",
+            ]
+        )
+
+        filtered = codex_sandbox_safe_path(original, is_windows=True)
+
+        assert filtered.split(os.pathsep) == [
+            r"C:\Program Files\Git\cmd",
+            r"C:\Windows\System32",
+        ]
+
+    def test_non_windows_path_is_unchanged(self) -> None:
+        from agent.transports.codex_app_server import codex_sandbox_safe_path
+
+        original = "/usr/local/bin:/usr/bin"
+        assert codex_sandbox_safe_path(original, is_windows=False) == original
+
+
 class TestCodexExecutableResolution:
     @staticmethod
     def _capture_spawn(

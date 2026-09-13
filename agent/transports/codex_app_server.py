@@ -38,6 +38,25 @@ from tools.environments.local import hermes_subprocess_env
 MIN_CODEX_VERSION = (0, 125, 0)
 
 
+def codex_sandbox_safe_path(path_value: str, *, is_windows: bool) -> str:
+    """Remove WindowsApps executables that restricted tokens cannot launch.
+
+    Microsoft Store/MSIX executables resolve normally for the interactive user
+    but fail with WinError 5 under both Codex Windows sandbox implementations.
+    In particular, Codex selects Store-packaged ``pwsh`` as its shell whenever
+    either the package directory or the per-user App Execution Alias directory
+    appears on PATH.  Removing those entries lets Codex fall back to the
+    machine-wide Windows PowerShell, while leaving non-Windows children alone.
+    """
+    if not is_windows or not path_value:
+        return path_value
+    return os.pathsep.join(
+        entry
+        for entry in path_value.split(os.pathsep)
+        if "windowsapps" not in entry.replace("/", "\\").lower().split("\\")
+    )
+
+
 def resolve_codex_command(
     codex_bin: str,
     argv: list[str],
@@ -187,6 +206,16 @@ class CodexAppServerClient:
         cmd = resolve_codex_command(
             codex_bin, ["app-server", *app_server_args], env=spawn_env
         )
+        # Resolve Codex itself against the user's complete PATH first, then
+        # remove Store/MSIX executable directories from the CHILD environment.
+        # Codex's restricted Windows token cannot launch a pwsh.exe selected
+        # from either Program Files\WindowsApps or the per-user WindowsApps
+        # alias directory (CreateProcessAsUserW error 5). With those entries
+        # absent, Codex reliably falls back to machine-wide PowerShell 5.1.
+        if "PATH" in spawn_env:
+            spawn_env["PATH"] = codex_sandbox_safe_path(
+                spawn_env["PATH"], is_windows=_subprocess_compat.IS_WINDOWS
+            )
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
 
