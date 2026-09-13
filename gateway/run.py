@@ -314,6 +314,63 @@ def _hygiene_compression_timeout_message(
     )
 
 
+def _stream_confirmed_final_delivery(
+    consumer,
+    final_text: str,
+    *,
+    previewed: bool = False,
+) -> bool:
+    """Return True only when the actual final reply reached the user.
+
+    Module-level (not a closure in ``_run_agent``) so the suppression contract
+    is directly testable — see
+    ``tests/gateway/test_commentary_final_duplicate_send.py``.
+
+    ``previewed`` is accepted but no longer read: the delivery check below is
+    now unconditional, which subsumes the old ``previewed``-gated branch. It
+    stays in the signature because both call sites pass it and the
+    duplicate-risk diagnostic still logs it as a decision input.
+    """
+    if consumer is None:
+        return False
+    if getattr(consumer, "final_response_sent", False):
+        # A successful finalize call is not proof the *content* was
+        # final: the edit may have carried only the last preview
+        # snapshot while the tail generated between that snapshot and
+        # stream completion never reached any API call (#71643).
+        # Reconcile the recorded turn-final payload against the
+        # completed response; only a demonstrable mismatch (False)
+        # overrides the flag — including payload-less multi-message
+        # split delivery (#78541). None (no record on a non-split
+        # legacy path) keeps the legacy trust so ambiguous-timeout
+        # dedup is not regressed.
+        matcher = getattr(consumer, "delivered_final_matches", None)
+        if callable(matcher):
+            try:
+                if matcher(final_text) is False:
+                    return False
+            except Exception:
+                pass
+        return True
+    # A visible frame carrying EXACTLY this final text is proof of delivery no
+    # matter which callback put it there. ``previewed`` (set when the agent
+    # streamed the text first) used to gate this check, so a non-streaming
+    # runtime that delivers its whole answer through one completed-commentary
+    # message — codex_app_server with display.streaming=false — produced
+    # previewed=False, no suppression, and the gateway sent the same text a
+    # second time. ``has_delivered_text`` compares against what actually went
+    # on the wire (``_delivered_commentary_texts`` / ``_delivered_segment_texts``
+    # / the visible prefix), so unrelated progress chatter still cannot
+    # suppress a genuinely different answer (#14238).
+    has_delivered_text = getattr(consumer, "has_delivered_text", None)
+    if callable(has_delivered_text):
+        try:
+            return bool(has_delivered_text(final_text))
+        except Exception:
+            return False
+    return False
+
+
 async def run_codex_hygiene_compaction(
     gateway,
     session_key: str,
@@ -30419,42 +30476,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _notify_task = asyncio.create_task(_notify_long_running())
 
-        def _stream_confirmed_final_delivery(
-            consumer,
-            final_text: str,
-            *,
-            previewed: bool = False,
-        ) -> bool:
-            """Return True only when the actual final reply reached the user."""
-            if consumer is None:
-                return False
-            if getattr(consumer, "final_response_sent", False):
-                # A successful finalize call is not proof the *content* was
-                # final: the edit may have carried only the last preview
-                # snapshot while the tail generated between that snapshot and
-                # stream completion never reached any API call (#71643).
-                # Reconcile the recorded turn-final payload against the
-                # completed response; only a demonstrable mismatch (False)
-                # overrides the flag — including payload-less multi-message
-                # split delivery (#78541). None (no record on a non-split
-                # legacy path) keeps the legacy trust so ambiguous-timeout
-                # dedup is not regressed.
-                matcher = getattr(consumer, "delivered_final_matches", None)
-                if callable(matcher):
-                    try:
-                        if matcher(final_text) is False:
-                            return False
-                    except Exception:
-                        pass
-                return True
-            if previewed:
-                has_delivered_text = getattr(consumer, "has_delivered_text", None)
-                if callable(has_delivered_text):
-                    try:
-                        return bool(has_delivered_text(final_text))
-                    except Exception:
-                        return False
-            return False
+        # _stream_confirmed_final_delivery is defined at module scope (see the
+        # top of this file) so the suppression contract is unit-testable.
 
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based
@@ -31266,10 +31289,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _transformed = bool(response.get("response_transformed"))
             # Only suppress the normal send when the actual final reply reached
             # the user: the stream consumer streamed it (final_response_sent /
-            # final_content_delivered), or the interim preview delivered that
-            # *exact* final text. Unrelated commentary/progress shown during a
-            # compression/session split must not be mistaken for the final
-            # response (#14238).
+            # final_content_delivered), or some visible frame — streamed
+            # preview, segment, or interim commentary — already carried that
+            # *exact* final text. Matching is whole-string, so unrelated
+            # commentary/progress shown during a compression/session split is
+            # never mistaken for the final response (#14238).
             _streamed = _stream_confirmed_final_delivery(
                 _sc,
                 _final,
