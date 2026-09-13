@@ -25,9 +25,12 @@ from __future__ import annotations
 
 import asyncio
 import faulthandler
+import hmac
 import json
 import logging
 import os
+import secrets
+import socket
 import sys
 import threading
 import time
@@ -455,17 +458,32 @@ def arm_shutdown_watchdog(
 async def _tick_socket_handler(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 ) -> None:
-    """Answer a liveness ping with one byte.
-
-    Runs on the gateway loop: the reply is produced only while the loop is
-    actually dispatching, so a successful read is a witness of loop
-    schedulability that no executor thread and no filesystem stall can
-    refresh. A UNIX-socket write is a socket-buffer copy — no fsync, no
-    disk I/O — so the witness keeps working on the exact filesystem that
-    stalls the heartbeat write. Best-effort; never raises.
-    """
+    """Answer a legacy UNIX-socket liveness ping with one byte."""
     try:
         writer.write(b"1")
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+async def _tick_tcp_handler(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    token: bytes,
+) -> None:
+    """Answer an authenticated loopback liveness challenge.
+
+    The probe sends a fresh nonce and the loop returns HMAC-SHA256(token, nonce),
+    proving knowledge of the per-process token without transmitting that token.
+    """
+    try:
+        nonce = await asyncio.wait_for(reader.readexactly(32), timeout=1.0)
+        writer.write(hmac.digest(token, nonce, "sha256"))
         await writer.drain()
     except Exception:
         pass
@@ -509,11 +527,12 @@ async def loop_heartbeat_forever(
     loop schedulability: a stalled write or a saturated executor can age the file
     while the loop runs, and a write that lands after the loop froze can keep it
     fresh. The file therefore stops being sufficient authority on its own. This
-    task also arms a loop-scheduling witness — a UNIX socket answered by the
-    loop itself (``_tick_socket_handler``) — and records whether it is armed in
-    the heartbeat payload (``loop_tick_socket``). External probes must require
-    the witness to agree with file staleness before classifying a loop as
-    wedged; see ``hermes_cli.gateway.probe_gateway_loop_liveness`` for the
+    task also arms a loop-scheduling witness answered by the loop itself:
+    a UNIX socket on POSIX or authenticated TCP loopback on native Windows.
+    The heartbeat payload records whether it is armed (``loop_tick_socket``)
+    plus transport metadata (``loop_tick_witness``). External probes must
+    require the witness to agree with file staleness before classifying a loop
+    as wedged; see ``hermes_cli.gateway.probe_gateway_loop_liveness`` for the
     two-witness contract.
     """
     try:
@@ -521,35 +540,45 @@ async def loop_heartbeat_forever(
     except (TypeError, ValueError):
         interval = DEFAULT_HEARTBEAT_INTERVAL_S
 
-    # Arm the loop-scheduling witness. Best-effort: a failed bind (permissions,
-    # path length) must not abort the gateway or the file heartbeat — it only
-    # disables the witness, and the payload flag tells probes that staleness is
-    # no longer sufficient authority to escalate.
-    #
-    # Windows: asyncio.start_unix_server raises (no AF_UNIX event-loop
-    # support), so the witness is PERMANENTLY absent there — the payload
-    # records loop_tick_socket=False and every stale-file probe classifies
-    # UNKNOWN, never WEDGED. That is deliberate fail-safe: a wedged native
-    # Windows gateway keeps the graceful-drain backstop instead of an
-    # escalation verdict built on a witness that cannot exist. (WSL2 — the
-    # #90502 incident environment — is Linux and arms the socket normally.)
+    # Arm the loop-scheduling witness. POSIX keeps the established UNIX socket
+    # contract; native Windows uses authenticated TCP on IPv4 loopback because
+    # its asyncio build has no start_unix_server/AF_UNIX support. Both servers
+    # run on this event loop, so a reply is direct proof of schedulability.
     tick_server = None
     tick_socket_path = None
+    tick_witness: Optional[Dict[str, Any]] = None
     try:
-        tick_socket_path = get_loop_tick_socket_path(home)
-        tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
-        # Re-bind over a leftover node from a dead process (os._exit(75) /
-        # SIGKILL skip the finally-unlink; PID reuse re-lands on this
-        # PID-suffixed path) is handled by asyncio itself:
-        # create_unix_server os.remove()s an existing socket node before
-        # binding — guarded by test_producer_rebinds_over_stale_socket_node.
-        # What asyncio does NOT do is clean up SIBLING nodes from other
-        # dead PIDs, so sweep those to keep state/ from accumulating
-        # gateway.loop-tick.*.sock nodes across crash-restart cycles.
-        # POSIX-only: os.kill(pid, 0) is a liveness probe here, but on
-        # Windows os.kill calls TerminateProcess for non-CTRL signals —
-        # and AF_UNIX server nodes are never created there anyway.
-        if os.name == "posix":
+        if os.name == "nt":
+            token = secrets.token_urlsafe(32)
+
+            async def _handle_tcp(
+                reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+            ) -> None:
+                await _tick_tcp_handler(reader, writer, token.encode("ascii"))
+
+            tick_server = await asyncio.start_server(
+                _handle_tcp,
+                host="127.0.0.1",
+                port=0,
+                family=socket.AF_INET,
+            )
+            sockets = tick_server.sockets or []
+            if not sockets:
+                raise OSError("loop-tick TCP server has no listening socket")
+            port = int(sockets[0].getsockname()[1])
+            tick_witness = {
+                "transport": "tcp",
+                "host": "127.0.0.1",
+                "port": port,
+                "token": token,
+            }
+        else:
+            tick_socket_path = get_loop_tick_socket_path(home)
+            tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
+            # Re-bind over a leftover node from a dead process (os._exit(75) /
+            # SIGKILL skip the finally-unlink; PID reuse re-lands on this
+            # PID-suffixed path) is handled by asyncio itself. Sweep sibling
+            # nodes from dead PIDs so state/ does not accumulate them.
             try:
                 for _stale in tick_socket_path.parent.glob(
                     "gateway.loop-tick.*.sock"
@@ -562,23 +591,26 @@ async def loop_heartbeat_forever(
                         _stale.unlink(missing_ok=True)
                         continue
                     try:
-                        os.kill(_stale_pid, 0)  # windows-footgun: ok — inside os.name == "posix" gate
+                        os.kill(_stale_pid, 0)
                     except OSError:
                         _stale.unlink(missing_ok=True)
             except Exception:
-                logger.debug(
-                    "stale loop-tick socket sweep failed", exc_info=True
-                )
-        tick_server = await asyncio.start_unix_server(
-            _tick_socket_handler, path=str(tick_socket_path)
-        )
-    except Exception:
+                logger.debug("stale loop-tick socket sweep failed", exc_info=True)
+            tick_server = await asyncio.start_unix_server(
+                _tick_socket_handler, path=str(tick_socket_path)
+            )
+            tick_witness = {"transport": "unix"}
+    except Exception as exc:
         tick_server = None
+        tick_witness = None
+        # Binding failure is actionable, but a full traceback at warning level
+        # made the formerly expected Windows capability gap look like a crash.
         logger.warning(
-            "Loop tick socket unavailable — liveness probes will have no "
-            "loop-scheduling witness and will not escalate on a stale heartbeat",
-            exc_info=True,
+            "Loop tick witness unavailable; stale-heartbeat probes will not "
+            "escalate (%s)",
+            exc,
         )
+        logger.debug("Loop tick witness startup failed", exc_info=True)
 
     async def _write_off_loop() -> None:
         # write_loop_heartbeat never raises, so a failure here is an executor
@@ -588,7 +620,10 @@ async def loop_heartbeat_forever(
                 write_loop_heartbeat,
                 start_time=start_time,
                 home=home,
-                extra={"loop_tick_socket": tick_server is not None},
+                extra={
+                    "loop_tick_socket": tick_server is not None,
+                    "loop_tick_witness": tick_witness,
+                },
             )
         except asyncio.CancelledError:
             raise

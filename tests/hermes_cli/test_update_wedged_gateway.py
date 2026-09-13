@@ -71,6 +71,52 @@ def _mark_witness_flag(home, armed, age_s=0.0):
     return path
 
 
+def _closed_tcp_witness():
+    """Return authenticated loopback metadata whose listener is already gone."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+    finally:
+        srv.close()
+    return {
+        "transport": "tcp",
+        "host": "127.0.0.1",
+        "port": port,
+        "token": "x" * 43,
+    }
+
+
+def _mark_silent_witness(home, pid, *, armed=True, age_s=0.0):
+    """Advertise a real transport endpoint that exists but cannot answer."""
+    path = get_loop_heartbeat_path(home)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if os.name == "nt":
+        payload["loop_tick_witness"] = _closed_tcp_witness()
+    else:
+        _silent_socket_node(get_loop_tick_socket_path(home, pid))
+    if armed is not None:
+        payload["loop_tick_socket"] = armed
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    if age_s:
+        stamp = time.time() - age_s
+        os.utime(path, (stamp, stamp))
+
+
+def _wait_for_advertised_witness(home, pid, timeout_s=5.0):
+    heartbeat = get_loop_heartbeat_path(home)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            payload = json.loads(heartbeat.read_text(encoding="utf-8"))
+            if payload.get("pid") == pid and payload.get("loop_tick_socket") is True:
+                return payload
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        time.sleep(0.02)
+    raise AssertionError("producer never armed the loop-tick witness")
+
+
 def _silent_socket_node(path):
     """Create a socket node at ``path`` that never answers.
 
@@ -536,11 +582,7 @@ class TestLoopTickWitness:
         thread = threading.Thread(target=run_producer, daemon=True)
         thread.start()
         try:
-            sock_path = get_loop_tick_socket_path(tmp_path, pid)
-            deadline = time.monotonic() + 5.0
-            while not sock_path.exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            assert sock_path.exists(), "producer never armed the tick socket"
+            _wait_for_advertised_witness(tmp_path, pid)
 
             hb_path = get_loop_heartbeat_path(tmp_path)
             deadline = time.monotonic() + 5.0
@@ -640,9 +682,8 @@ class TestLoopTickWitness:
         denying the false-fresh window the review described.
         """
         pid = 4242
-        _silent_socket_node(get_loop_tick_socket_path(tmp_path, pid))
         _write_heartbeat(tmp_path, pid, age_s=5.0)
-        _mark_witness_flag(tmp_path, armed=True)
+        _mark_silent_witness(tmp_path, pid, armed=True)
         assert (
             gateway_cli.probe_gateway_loop_liveness(
                 pid, home=tmp_path, tick_timeout=0.2
@@ -660,9 +701,8 @@ class TestLoopTickWitness:
         satisfied here: all ``tick_strikes`` consecutive probes miss.
         """
         pid = 4242
-        _silent_socket_node(get_loop_tick_socket_path(tmp_path, pid))
         _write_heartbeat(tmp_path, pid, age_s=600.0)
-        _mark_witness_flag(tmp_path, armed=True, age_s=600.0)
+        _mark_silent_witness(tmp_path, pid, armed=True, age_s=600.0)
         assert (
             gateway_cli.probe_gateway_loop_liveness(
                 pid,
@@ -813,7 +853,7 @@ class TestLoopTickWitness:
         # socket denies ALIVE, and UNKNOWN never escalates — the drain path
         # keeps the full budget either way.
         _write_heartbeat(tmp_path, pid, age_s=5.0)
-        _silent_socket_node(get_loop_tick_socket_path(tmp_path, pid))
+        _mark_silent_witness(tmp_path, pid, armed=None)
         assert (
             gateway_cli.probe_gateway_loop_liveness(
                 pid, home=tmp_path, tick_timeout=0.2
@@ -822,18 +862,13 @@ class TestLoopTickWitness:
         )
 
     @pytest.mark.asyncio
-    async def test_producer_rebinds_over_stale_socket_node(self, tmp_path):
-        """A leftover node from a dead process must not disarm the witness.
-
-        os._exit(75) / SIGKILL skip the finally-unlink, and PID reuse then
-        re-lands on the same PID-suffixed path. Without the pre-bind unlink
-        the bind fails EADDRINUSE, the except disarms the witness
-        (loop_tick_socket:false), and a stale heartbeat can never classify
-        WEDGED — precisely on crash-restart loops.
-        """
-        sock_path = get_loop_tick_socket_path(tmp_path)
-        _silent_socket_node(sock_path)  # dead process's leftover node
-        assert sock_path.exists()
+    async def test_producer_recovers_from_stale_transport_state(self, tmp_path):
+        """Crash leftovers must not prevent a new process from arming a witness."""
+        sock_path = None
+        if os.name != "nt":
+            sock_path = get_loop_tick_socket_path(tmp_path)
+            _silent_socket_node(sock_path)  # dead process's leftover node
+            assert sock_path.exists()
 
         task = asyncio.create_task(
             loop_heartbeat_forever(interval_s=0.2, home=tmp_path)
@@ -847,14 +882,23 @@ class TestLoopTickWitness:
                         break
                 await asyncio.sleep(0.05)
             else:
-                raise AssertionError(
-                    "witness never armed over the stale socket node"
+                raise AssertionError("witness never armed after stale transport state")
+
+            if os.name == "nt":
+                assert payload["loop_tick_witness"]["transport"] == "tcp"
+                verdict = await asyncio.to_thread(
+                    gateway_cli.probe_gateway_loop_liveness,
+                    payload["pid"],
+                    home=tmp_path,
+                    tick_timeout=1.0,
                 )
-            # And it actually answers: the node is live, not the leftover.
-            reader, writer = await asyncio.open_unix_connection(str(sock_path))
-            data = await asyncio.wait_for(reader.read(64), timeout=2)
-            writer.close()
-            assert data, "re-bound tick socket gave no answer"
+                assert verdict == gateway_cli.GATEWAY_LOOP_ALIVE
+            else:
+                assert sock_path is not None
+                reader, writer = await asyncio.open_unix_connection(str(sock_path))
+                data = await asyncio.wait_for(reader.read(64), timeout=2)
+                writer.close()
+                assert data, "re-bound tick socket gave no answer"
         finally:
             task.cancel()
             try:
@@ -887,11 +931,7 @@ class TestLoopTickWitness:
         state, ready = _start_freezeable_producer(tmp_path, block_s, errors)
         try:
             assert ready.wait(timeout=5.0)
-            sock_path = get_loop_tick_socket_path(tmp_path, pid)
-            deadline = time.monotonic() + 5.0
-            while not sock_path.exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            assert sock_path.exists(), "producer never armed the tick socket"
+            _wait_for_advertised_witness(tmp_path, pid)
             _wait_heartbeat_stale(tmp_path, stale_after)
 
             state["trigger"]()  # freeze the loop for block_s
@@ -938,11 +978,7 @@ class TestLoopTickWitness:
         state, ready = _start_freezeable_producer(tmp_path, block_s, errors)
         try:
             assert ready.wait(timeout=5.0)
-            sock_path = get_loop_tick_socket_path(tmp_path, pid)
-            deadline = time.monotonic() + 5.0
-            while not sock_path.exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            assert sock_path.exists(), "producer never armed the tick socket"
+            _wait_for_advertised_witness(tmp_path, pid)
             _wait_heartbeat_stale(tmp_path, stale_after)
 
             state["trigger"]()  # freeze the loop for block_s

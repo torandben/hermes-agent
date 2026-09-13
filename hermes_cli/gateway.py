@@ -6,6 +6,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 
 import asyncio
 from hermes_cli.cli_output import line_input
+import hmac
 import json
 import logging
 import os
@@ -385,9 +386,10 @@ def _wait_for_pid_exit(pid: int, timeout: float) -> bool:
 # file its status as *proof*: a stalled write or a saturated executor can age
 # the file while the loop runs, and an off-loop write can land after the loop
 # froze, keeping the file fresh for a dead loop. The loop therefore also arms
-# a second witness — ``state/gateway.loop-tick.<pid>.sock``, a UNIX socket
-# answered by the loop itself — and records whether it is armed in the
-# heartbeat payload (``loop_tick_socket``).
+# a second witness answered by the loop itself: a UNIX socket on POSIX or an
+# authenticated TCP/IPv4 loopback endpoint on native Windows. The producer
+# records whether it is armed (``loop_tick_socket``) and its transport metadata
+# (``loop_tick_witness``) in the heartbeat payload.
 #
 # ``probe_gateway_loop_liveness`` reads both signals (a local stat + JSON
 # read + a bounded socket ping, repeated up to ``tick_strikes`` times when a
@@ -475,10 +477,75 @@ def _probe_loop_tick_socket(
                 pass
 
 
+def _probe_loop_tick_tcp(witness: object, timeout: float = 1.0) -> bool | None:
+    """Ping an authenticated IPv4 loopback witness advertised in a heartbeat."""
+    if not isinstance(witness, dict) or witness.get("transport") != "tcp":
+        return None
+    try:
+        host = str(witness["host"])
+        port = int(witness["port"])
+        token = str(witness["token"]).encode("ascii")
+        if (
+            host != "127.0.0.1"
+            or not 0 < port <= 65535
+            or not 32 <= len(token) <= 128
+        ):
+            return None
+    except (KeyError, TypeError, ValueError, UnicodeError):
+        return None
+
+    sock = None
+    try:
+        timeout_s = max(float(timeout), 0.0)
+        deadline = time.monotonic() + timeout_s
+        sock = socket.create_connection((host, port), timeout=timeout_s)
+        nonce = os.urandom(32)
+        expected = hmac.digest(token, nonce, "sha256")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        sock.settimeout(remaining)
+        sock.sendall(nonce)
+        response = bytearray()
+        while len(response) < len(expected):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            sock.settimeout(remaining)
+            chunk = sock.recv(len(expected) - len(response))
+            if not chunk:
+                return False
+            response.extend(chunk)
+        return hmac.compare_digest(response, expected)
+    except Exception:
+        # A valid advertised endpoint that cannot answer is a missed witness.
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def _probe_loop_tick_witness(
+    pid: int,
+    home: Path | None,
+    payload: dict,
+    timeout: float = 1.0,
+) -> bool | None:
+    """Probe the advertised transport, falling back to the legacy UNIX node."""
+    witness = payload.get("loop_tick_witness")
+    if isinstance(witness, dict) and witness.get("transport") == "tcp":
+        return _probe_loop_tick_tcp(witness, timeout=timeout)
+    return _probe_loop_tick_socket(pid, home, timeout=timeout)
+
+
 def _probe_loop_tick_socket_sustained(
     pid: int,
     home: Path | None,
     *,
+    payload: dict | None = None,
     timeout: float = 1.0,
     strikes: int = 3,
     gap_s: float = 0.2,
@@ -502,8 +569,9 @@ def _probe_loop_tick_socket_sustained(
               legacy producer): not evidence either way.
     """
     total = max(int(strikes), 0)
+    resolved_payload = payload or {}
     for attempt in range(total):
-        result = _probe_loop_tick_socket(pid, home, timeout=timeout)
+        result = _probe_loop_tick_witness(pid, home, resolved_payload, timeout=timeout)
         if result is True:
             return True
         if result is None:
@@ -530,10 +598,11 @@ def probe_gateway_loop_liveness(
 
     Two witnesses:
 
-    - the loop-tick socket (``state/gateway.loop-tick.<pid>.sock``): answered
-      by the gateway loop itself, so a reply is direct proof that the loop is
-      dispatching. It is never refreshed by the heartbeat executor thread and
-      never stalled by a filesystem that is slow to fsync.
+    - the loop-tick witness (UNIX socket on POSIX, authenticated TCP loopback
+      on Windows): answered by the gateway loop itself, so a reply is direct
+      proof that the loop is dispatching. It is never refreshed by the
+      heartbeat executor thread and never stalled by a filesystem that is slow
+      to fsync.
     - the heartbeat file (``state/gateway.heartbeat``): rewritten every 30s
       on a thread since #90502, so freshness alone is no longer proof of loop
       schedulability — a stalled write (measured at 112.6s max on the
@@ -573,7 +642,7 @@ def probe_gateway_loop_liveness(
         # up, or a stale file from a previous PID.  Not evidence of a wedge.
         return GATEWAY_LOOP_UNKNOWN
 
-    witness = _probe_loop_tick_socket(pid, home, timeout=tick_timeout)
+    witness = _probe_loop_tick_witness(pid, home, payload, timeout=tick_timeout)
     if witness is True:
         # The loop answered a ping — it is dispatching right now. A stale
         # heartbeat file is a stalled write or a saturated executor, not a
@@ -611,6 +680,7 @@ def probe_gateway_loop_liveness(
         sustained = _probe_loop_tick_socket_sustained(
             pid,
             home,
+            payload=payload,
             timeout=tick_timeout,
             strikes=tick_strikes - 1,
             gap_s=tick_gap_s,
