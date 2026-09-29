@@ -74,7 +74,7 @@ KANBAN_LIST_SCHEMA = _schema(
             "type": "string",
             "enum": [
                 "triage", "todo", "ready", "running",
-                "blocked", "done", "archived",
+                "blocked", "done", "archived", "cancelled",
             ],
             "description": "Optional task status filter.",
         },

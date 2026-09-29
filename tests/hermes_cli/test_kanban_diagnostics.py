@@ -95,6 +95,17 @@ def test_running_with_open_parents_fires_only_while_running():
     assert kd.compute_task_diagnostics(_task(status="running"), [], [], graph=done_graph) == []
 
 
+def test_cancelled_task_raises_no_failure_diagnostics():
+    """A card the operator stopped is history: its failure streak must not keep
+    raising crash/failure banners on the board."""
+    runs = [_run(outcome="crashed", run_id=i, error="boom") for i in range(1, 6)]
+    cancelled = _task(status="cancelled", consecutive_failures=5, last_failure_error="boom")
+    assert kd.compute_task_diagnostics(cancelled, [], runs) == []
+    # Sibling path: the same streak on a live card still fires.
+    assert kd.compute_task_diagnostics(_task(status="ready", consecutive_failures=5,
+                                             last_failure_error="boom"), [], runs) != []
+
+
 def test_stuck_in_blocked_fires_past_threshold():
     now = int(time.time())
     task = _task(status="blocked")

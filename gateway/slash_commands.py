@@ -36,6 +36,28 @@ from utils import atomic_json_write, is_truthy_value
 logger = logging.getLogger("gateway.run")
 
 
+# /stop's Kanban cancellation budget. The cancel can wait ~5 s per worker for a
+# process to exit and walks every doomed descendant; beyond this the reply goes
+# out and the cancel finishes in the background.
+_KANBAN_CANCEL_TIMEOUT_S = 20.0
+
+
+class _KanbanCancelPending:
+    """/stop's reply was sent before the Kanban cancellation finished."""
+
+
+def _log_late_kanban_cancel(fut) -> None:
+    """Record the eventual result of a cancel that outlived /stop's reply."""
+    try:
+        result = fut.result()
+    except Exception:
+        logger.warning("STOP: background kanban cancellation failed", exc_info=True)
+        return
+    if result is not None:
+        logger.info("STOP: background kanban cancellation finished — cancelled=%s unverified=%s",
+                    getattr(result, "cancelled", []), getattr(result, "workers_unverified", []))
+
+
 # /rollback result keys -> i18n line for files the safe restore left alone.
 _ROLLBACK_SKIP_LINES = (("skipped_user_edits", "gateway.rollback.kept_user_edits"),
                         ("skipped_oversize", "gateway.rollback.kept_oversize"),
@@ -435,10 +457,10 @@ class GatewaySlashCommandsMixin(
         if agent is _AGENT_PENDING_SENTINEL:  # force-clean the sentinel so the session is unlocked
             await _stop(session_key, "stop_command_pending")
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
-            return EphemeralReply(t("gateway.stop.stopped_pending"))
+            return await self._stop_reply_with_kanban("gateway.stop.stopped_pending", source=source)
         if agent:  # force-clean the session lock so a truly hung agent doesn't keep it forever
             await _stop(session_key, "stop_command_handler")
-            return EphemeralReply(t("gateway.stop.stopped"))
+            return await self._stop_reply_with_kanban("gateway.stop.stopped", source=source)
 
         # No run under the caller's own key: a live turn in THIS chat may still carry a differently
         # shaped key. One scan feeds both tiers; the chat tier is a superset of the thread-sibling
@@ -461,14 +483,14 @@ class GatewaySlashCommandsMixin(
                 await _stop(fallback_key, reason)
             logger.info("STOP (%s) by %s — interrupted %d run(s): %s",
                         reason, session_key, len(fallback_keys), ", ".join(fallback_keys))
-            return EphemeralReply(t("gateway.stop.stopped"))
+            return await self._stop_reply_with_kanban("gateway.stop.stopped", source=source)
 
         # No running agent anywhere for this scope. Background delegations the session dispatched in an
         # earlier turn still count as "active": stop them; each returns as an interrupted completion.
         from tools.async_delegation import interrupt_for_session
         if interrupt_for_session(session_key=session_key, reason="stop_command",
                                  parent_session_id=str(getattr(session_entry, "session_id", "") or "")):
-            return EphemeralReply(t("gateway.stop.stopped"))
+            return await self._stop_reply_with_kanban("gateway.stop.stopped", source=source)
         # A platform status indicator can still be stuck —
         # e.g. Slack's persistent assistant.threads.setStatus survives a gateway restart or a turn
         # that died without a final send.
@@ -479,7 +501,116 @@ class GatewaySlashCommandsMixin(
                 await adapter._stop_typing_with_metadata(source.chat_id, self._reply_metadata(event))
         except Exception:
             logger.debug("Failed to clear typing on /stop with no active agent", exc_info=True)
+        # Even with no agent turn in flight, dispatched Kanban work for this
+        # conversation can still be queued or running — precisely what the
+        # operator means by /stop after an orchestrator handed off. Report BOTH.
+        kanban_lines = self._kanban_cancel_lines(await self._cancel_kanban_for_source(source=source))
+        if kanban_lines:
+            return EphemeralReply("\n".join([t("gateway.stop.no_active"), *kanban_lines]))
         return t("gateway.stop.no_active")
+
+    # --- /stop: cancel the Kanban work this conversation dispatched ---
+
+    def _cancel_kanban_for_source_blocking(self, *, source):
+        """Cancel Kanban work routed to ``source``'s conversation on every live
+        board. BLOCKING — call via :meth:`_cancel_kanban_for_source`.
+
+        Opt-in via ``kanban.cancel_on_stop`` (default off) so existing
+        deployments keep ``/stop`` = interrupt the agent turn only. Never raises:
+        a missing/locked/old-schema board must not break the emergency brake.
+        Returns a ``CancelSourceResult``-shaped object, or None when off.
+        """
+        try:
+            from hermes_cli.config import load_config
+
+            if not is_truthy_value(cfg_get(load_config(), "kanban", "cancel_on_stop", default=False)):
+                return None
+        except Exception:
+            logger.debug("Kanban cancel-on-stop config read failed", exc_info=True)
+            return None
+        try:
+            from hermes_cli import kanban_db as kb
+            from hermes_cli import kanban_db_connect as kbc
+        except Exception:
+            logger.debug("Kanban unavailable for /stop", exc_info=True)
+            return None
+        total = kb.CancelSourceResult()
+        try:
+            boards = kb.list_boards(include_archived=False) or [{"slug": kb.DEFAULT_BOARD}]
+        except Exception:
+            boards = [{"slug": kb.DEFAULT_BOARD}]
+        seen: set[str] = set()
+        for meta in boards:
+            slug = meta.get("slug") or kb.DEFAULT_BOARD
+            key = str(meta.get("db_path") or slug)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                conn = kbc.connect(board=slug)
+            except Exception:
+                logger.debug("Kanban /stop: cannot open board %s", slug, exc_info=True)
+                continue
+            try:
+                part = kb.cancel_tasks_for_notify_source(
+                    conn,
+                    platform=source.platform.value if source.platform else "",
+                    chat_id=str(source.chat_id or ""),
+                    thread_id=str(source.thread_id or ""),
+                    reason="operator /stop",
+                )
+                for name in ("cancelled", "detached", "preserved", "orphaned", "workers_unverified"):
+                    getattr(total, name).extend(getattr(part, name))
+            except Exception:
+                logger.debug("Kanban cancel on /stop failed for board %s", slug, exc_info=True)
+            finally:
+                conn.close()
+        return total
+
+    async def _cancel_kanban_for_source(self, *, source):
+        """Run the blocking cancel off the event loop, bounded by
+        ``_KANBAN_CANCEL_TIMEOUT_S``. It does SQLite I/O and can wait seconds per
+        worker for a process to exit; inline it would freeze every platform on
+        the one command an operator reaches for when things are going wrong.
+
+        On timeout the worker thread keeps running (a thread cannot be
+        cancelled) and finishes the cancel in the background; the reply says so
+        instead of claiming a result it has not seen.
+        """
+        work = asyncio.ensure_future(asyncio.to_thread(self._cancel_kanban_for_source_blocking, source=source))
+        try:
+            return await asyncio.wait_for(asyncio.shield(work), timeout=_KANBAN_CANCEL_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.warning("STOP: kanban cancellation still running after %.0fs; continuing in background",
+                           _KANBAN_CANCEL_TIMEOUT_S)
+            work.add_done_callback(_log_late_kanban_cancel)
+            return _KanbanCancelPending()
+
+    def _kanban_cancel_lines(self, result) -> list[str]:
+        """One line per distinct outcome, so the operator is never told
+        "cancelled" about work that is actually still running."""
+        if result is None:
+            return []
+        if isinstance(result, _KanbanCancelPending):
+            return [t("gateway.stop.kanban_pending", seconds=int(_KANBAN_CANCEL_TIMEOUT_S))]
+        lines: list[str] = []
+        for attr, key, level in (
+            ("cancelled", "gateway.stop.kanban_cancelled", logging.INFO),
+            ("detached", "gateway.stop.kanban_detached", logging.INFO),
+            ("preserved", "gateway.stop.kanban_preserved", logging.INFO),
+            ("orphaned", "gateway.stop.kanban_orphaned", logging.INFO),
+            ("workers_unverified", "gateway.stop.kanban_unverified", logging.WARNING),
+        ):
+            ids = list(getattr(result, attr, []) or [])
+            if ids:
+                lines.append(t(key, count=len(ids)))
+                logger.log(level, "STOP kanban %s %d task(s): %s", attr, len(ids), ", ".join(ids))
+        return lines
+
+    async def _stop_reply_with_kanban(self, base_key: str, *, source) -> EphemeralReply:
+        """The /stop reply plus the Kanban cancellation summary (if enabled)."""
+        lines = [t(base_key), *self._kanban_cancel_lines(await self._cancel_kanban_for_source(source=source))]
+        return EphemeralReply("\n".join(lines))
 
     async def _handle_platform_command(self, event: MessageEvent) -> str:
         """Handle ``/platform list|pause|resume [name]`` — inspect and manually control failed/paused

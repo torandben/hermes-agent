@@ -140,6 +140,23 @@ class TestCollectKanbanNotifications:
         assert len(rows) == 1
         assert rows[0]["last_event_id"] > pre_cursor
 
+    def test_cancelled_delivers_once_and_removes_subscription(self):
+        """cancelled is final like archived: report it once, then unsubscribe."""
+        tid = _create_subscribed_task()
+        conn = kbc.connect()
+        try:
+            assert kb._cancel_one_task(conn, tid, reason="operator /stop") is True
+        finally:
+            conn.close()
+
+        first = _collect_kanban_notifications(_session())
+        second = _collect_kanban_notifications(_session())
+
+        assert len(first) == 1 and "cancelled" in first[0]
+        assert "operator /stop" in first[0]
+        assert second == []
+        assert _sub_rows(tid) == []
+
     def test_non_tui_subscription_does_not_open_board_writable(self):
         tid = _create_subscribed_task(platform="telegram", chat_id="chat-1")
         # New subs start caught up at creation time (issue #29905); record the

@@ -134,7 +134,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 
 # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds (archived/unblocked) too so the cursor advances
 # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
-_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+_KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "cancelled", "unblocked")
 # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
 # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
 _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = _BOT_DELIVERY_POLL_SECONDS = 5.0
@@ -328,6 +328,7 @@ _KANBAN_EVENT_FORMATTERS = {
     "crashed": ("✖", lambda t, p, title: " worker crashed (pid gone); dispatcher will retry"),
     "timed_out": ("⏱", _kb_timed_out),
     "status": ("🔄", lambda t, p, title: f" → {p.get('status') or ''}"),
+    "cancelled": ("🛑", lambda t, p, title: " cancelled" + (f": {str(p.get('reason'))[:160]}" if p.get("reason") else "")),
 }
 
 
@@ -388,9 +389,9 @@ def _kb_poll_board(_kb, slug: str, session_key: str) -> list:
                 text = _format_kanban_event_text(sub, task, ev, slug)
                 if text:
                     texts.append(DiagnosticText(text) if diagnostic_event(ev) else text)
-            # Unsubscribe only on archive: ``done`` is reversible in review/controller flows, so keeping the sub lets a
-            # later reopen notify the same session. The claimed cursor prevents replay.
-            if task and getattr(task, "status", "") == "archived":
+            # Unsubscribe only on archive/cancel: ``done`` is reversible in review/controller flows, so keeping the
+            # sub lets a later reopen notify the same session. The claimed cursor prevents replay.
+            if task and getattr(task, "status", "") in ("archived", "cancelled"):
                 with contextlib.suppress(Exception):
                     _kbn.remove_notify_sub(conn, **sub_ident)
     return texts

@@ -303,7 +303,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove archived tasks' scratch workspaces, old events, and old worker logs."""
+    """Remove archived/cancelled tasks' scratch workspaces, old events, and old worker logs."""
     import shutil
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
@@ -314,7 +314,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         rows = conn.execute(
             "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
-            "WHERE status = 'archived'"
+            "WHERE status IN ('archived', 'cancelled')"
         ).fetchall()
     for row in rows:
         if row["workspace_kind"] == "worktree":

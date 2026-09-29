@@ -124,6 +124,64 @@ If you're considering adding a CLI lane, open an issue describing the specific C
 
 The historical issue for this is [#19931](https://github.com/NousResearch/hermes-agent/issues/19931) and the closed-not-merged Codex-specific PR [#19924](https://github.com/NousResearch/hermes-agent/pull/19924) — those describe the original architecture proposal but didn't land a runner.
 
+## Anti-loop guards for chat-driven orchestration
+
+When an orchestrator profile takes requests from a chat platform (Discord, Telegram, Slack) and fans them out to specialist lanes, two extra guards matter. Both are **off by default** — existing boards behave exactly as before until you opt in.
+
+### Make a specialist lane leaf-only
+
+```yaml
+# The SPECIALIST profile's config.yaml (not the orchestrator's)
+kanban:
+  allow_worker_child_tasks: false
+```
+
+A worker with this set cannot create new cards: `kanban_create` is removed from its tool schema, and the handler refuses the call even if the model tries anyway. The worker still claims, heartbeats, comments, blocks, and completes its own card normally — it just cannot fan out more work.
+
+Use it on every specialist that should do one job and report back. Without it, a confused worker can spawn siblings that spawn siblings, and the board grows faster than you can read it.
+
+A successful read of the policy is cached per profile, so the tool list stays stable for the whole conversation. If the config cannot be read (mid-write, malformed YAML) that call **fails closed** — no child tasks — and the next call reads it again, so a transient error never pins a worker to leaf-only for good.
+
+### Make `/stop` also stop the dispatched work
+
+```yaml
+# The ORCHESTRATOR profile's config.yaml (the one running the gateway)
+kanban:
+  cancel_on_stop: true
+```
+
+By default `/stop` interrupts only the agent turn in front of you. Any Kanban tasks already handed to specialists keep running and keep reporting into the conversation you just stopped. With this enabled, `/stop` also stops the work routed back to *that same conversation*, on every board.
+
+Scoping is by notify subscription — the exact routing key results would be delivered on — so work can only be stopped from a conversation it would have replied to. Concretely, from a Discord thread:
+
+| Situation | What `/stop` does |
+|---|---|
+| Task subscribed to this thread only | Cancelled, worker process signalled |
+| Task also subscribed to another thread/channel | **Left running.** Only this conversation unsubscribes |
+| Child task whose every parent is being cancelled | Cancelled too, deepest-first |
+| Child task another live lane still feeds (fan-in) | **Parked as `blocked`** with the reason, until an operator decides |
+| Child task that reports to a different conversation | Left running |
+| Task already `done` / `archived` | Untouched |
+| Work in a sibling thread | Untouched |
+| A `/stop` typed in the channel, not the thread | Hits channel-level work only, not the thread's |
+
+Cancelled tasks land in a terminal `cancelled` status. Unlike `archived`, `cancelled` does **not** satisfy a dependency, so stopping a lane can never promote its children into the dispatcher queue — the failure mode where `/stop` dispatches the very work it was asked to kill. For the same reason a cancelled task cannot be archived; it is already hidden from the board and `hermes kanban list`, and can be deleted outright.
+
+The reply distinguishes every outcome so you are never told "cancelled" about something still running:
+
+```text
+⚡ Stopped. You can continue this session.
+🛑 Cancelled 3 queued/running Kanban task(s) routed to this conversation.
+🔗 1 task(s) are shared with another conversation — left running, this conversation unsubscribed.
+⚠️ 1 task(s) were marked cancelled but their worker process could not be confirmed stopped — check `hermes kanban show <id>`.
+```
+
+The `⚠️` line appears when the worker was claimed by a different host, survived `SIGTERM` and `SIGKILL`, or was still being spawned when `/stop` arrived (the dispatcher kills that one itself as soon as it sees the claim is gone, but `/stop` cannot prove it from where it stands). The board row is terminal either way — it cannot be re-dispatched — but the OS process may still be alive, so check rather than assume.
+
+Cancellation is bounded: if workers are slow to die, `/stop` replies after 20 seconds with `⏳ ... still running ... will finish in the background` instead of hanging.
+
+Every cancellation writes a `cancelled` event with its reason, every detach writes `notify_detached`, and a worker killed mid-spawn writes `spawn_aborted_cancelled`, so `hermes kanban show <id>` explains later why a card died.
+
 ## Failure modes the dispatcher handles
 
 So lane authors don't have to reimplement these:

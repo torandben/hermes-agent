@@ -1465,21 +1465,50 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection, task_id: str, pid: int, *, expected_claim_lock: Optional[str] = None,
+) -> bool:
     """Record the spawned child's pid + its restart-stable fingerprint (``_process_fingerprint``), and
     emit a ``spawned`` event carrying them. The fingerprint is what lets every later liveness/kill
     decision tell OUR worker from a process that recycled the PID after a reboot. A failed capture is
     persisted as ``UNVERIFIED_WORKER_FINGERPRINT``, never NULL: NULL is the legacy pre-fingerprint row
-    whose bare-PID kill authority a new spawn must not inherit."""
+    whose bare-PID kill authority a new spawn must not inherit.
+
+    With ``expected_claim_lock`` the write is fenced to that exact claim. False means the claim was TAKEN
+    AWAY between claim and spawn — the card is ``cancelled``/``archived`` (``/stop``), or it was
+    re-claimed under a different lock — so the caller owns an untracked child and must terminate it.
+    Stamping it anyway put a live worker onto a cancelled row while ``/stop`` reported a clean stop.
+    A card the worker already advanced itself (a fast ``kanban_complete``/``kanban_block``) is not a
+    lost claim: the PID still lands on the run row so ``reap_terminal_workers`` can see it."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
     with _kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                     (int(pid), started_at, task_id))
+        if expected_claim_lock is None:
+            conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                         (int(pid), started_at, task_id))
+        elif conn.execute(
+            "UPDATE tasks SET worker_pid = ?, worker_started_at = ? "
+            "WHERE id = ? AND status = 'running' AND claim_lock = ?",
+            (int(pid), started_at, task_id, expected_claim_lock),
+        ).rowcount != 1:
+            row = conn.execute("SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None or row["status"] in ("cancelled", "archived") or (
+                row["claim_lock"] is not None and row["claim_lock"] != expected_claim_lock
+            ):
+                _kb._append_event(conn, task_id, "spawn_aborted_cancelled",
+                                  {"pid": int(pid), "started_at": started_at,
+                                   "status": row["status"] if row else None})
+                return False
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, worker_started_at = ? "
+                "WHERE task_id = ? AND claim_lock = ? AND worker_pid IS NULL",
+                (int(pid), started_at, task_id, expected_claim_lock))
+            return True
         run_id = _kb._current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                          (int(pid), started_at, run_id))
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
+    return True
 
 
 def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: int) -> bool:
@@ -2122,8 +2151,14 @@ def _dispatch_lane_task(
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
-        if pid:
-            _set_worker_pid(conn, claimed.id, int(pid))
+        if pid and not _set_worker_pid(conn, claimed.id, int(pid), expected_claim_lock=claimed.claim_lock):
+            # The claim died while the child was being created (``/stop``
+            # cancelled it). We are the only holder of this PID: kill it now or
+            # it runs untracked against a terminal card.
+            termination = _terminate_reclaimed_worker(int(pid), claimed.claim_lock)
+            _kb._log.warning("kanban dispatcher: %s lost its claim during spawn; terminated pid %s: %s",
+                             claimed.id, pid, termination)
+            return False
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on

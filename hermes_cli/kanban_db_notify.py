@@ -297,7 +297,7 @@ def purge_stale_done_notify_subs(conn: sqlite3.Connection, *, max_age_days: int 
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id IN ("
             " SELECT t.id FROM tasks t"
-            " WHERE t.status IN ('done', 'blocked')"
+            " WHERE t.status IN ('done', 'blocked', 'cancelled')"
             " AND COALESCE("
             "  (SELECT MAX(e.created_at) FROM task_events e"
             "   WHERE e.task_id = t.id),"

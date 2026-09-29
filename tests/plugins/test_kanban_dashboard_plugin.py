@@ -66,15 +66,32 @@ def test_board_empty(client):
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     data = r.json()
-    # All canonical columns present (triage + the rest), each empty.
+    # All canonical columns present (triage + the rest), each empty. Terminal-
+    # but-hidden statuses (archived, cancelled) sit behind the filter toggle.
     names = [c["name"] for c in data["columns"]]
-    assert set(names) == kb.VALID_STATUSES - {"archived"}
+    assert set(names) == kb.VALID_STATUSES - {"archived", "cancelled"}
     for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
+
+
+def test_cancelled_card_never_lands_in_todo(client):
+    """A status missing from BOARD_COLUMNS falls into ``todo``; finished,
+    cancelled work must never read as un-started work."""
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="dead", assignee="w")
+        kb._cancel_one_task(conn, tid, reason="operator /stop")
+
+    for include in (False, True):
+        cols = {c["name"]: c["tasks"] for c in client.get(
+            "/api/plugins/kanban/board", params={"include_archived": include}).json()["columns"]}
+        assert tid not in {t["id"] for t in cols["todo"]}
+    assert [t["id"] for t in cols["cancelled"]] == [tid]
 
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it

@@ -164,9 +164,13 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
 
 # --- Serialization helpers --------------------------------------------------
 
-# Dashboard columns, left-to-right ("archived" is a filter toggle, not a column). Keep in
-# sync with kanban_db.VALID_STATUSES — a status missing here gets mis-bucketed into ``todo``.
+# Dashboard columns, left-to-right ("archived"/"cancelled" are behind a filter toggle, not
+# columns). Keep in sync with kanban_db.VALID_STATUSES — a status missing here AND from
+# HIDDEN_TERMINAL_COLUMNS gets mis-bucketed into ``todo``.
 BOARD_COLUMNS: list[str] = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"]
+# Terminal statuses kept out of BOARD_COLUMNS. They must never fall through to ``todo``:
+# finished work showing as un-started would read as "still queued".
+HIDDEN_TERMINAL_COLUMNS: tuple[str, ...] = ("archived", "cancelled")
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
@@ -209,7 +213,7 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
     if task_ids is not None:
         rows = conn.execute(f"SELECT * FROM tasks WHERE id IN ({_placeholders(task_ids)})", tuple(task_ids)).fetchall()
     else:
-        rows = conn.execute("SELECT * FROM tasks WHERE status != 'archived'").fetchall()
+        rows = conn.execute("SELECT * FROM tasks WHERE status NOT IN ('archived', 'cancelled')").fetchall()
     if not rows:
         return {}
     row_ids = [r["id"] for r in rows]
@@ -309,7 +313,8 @@ def get_board(
         latest_event_id = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
         if include_archived:
-            columns["archived"] = []
+            for hidden in HIDDEN_TERMINAL_COLUMNS:
+                columns[hidden] = []
         # One window-function query for latest summaries (avoids N+1); cards get a
         # truncated preview, the full text comes from /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
@@ -324,7 +329,10 @@ def get_board(
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             _attach_diagnostics(d, diagnostics_per_task.get(t.id))
-            columns[t.status if t.status in columns else "todo"].append(d)
+            if t.status in columns:
+                columns[t.status].append(d)
+            elif t.status not in HIDDEN_TERMINAL_COLUMNS:
+                columns["todo"].append(d)
 
         # Queue lanes keep the list_tasks dispatch order; the done column is
         # history, so order it newest-completed-first. Two stable sorts compose
@@ -335,7 +343,7 @@ def get_board(
         # Queue columns keep list_tasks' dispatch order (priority DESC, created_at ASC).
         tenants = [r["tenant"] for r in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
         assignees = [r["assignee"] for r in conn.execute(
-            "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND status != 'archived' ORDER BY assignee")]
+            "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND status NOT IN ('archived', 'cancelled') ORDER BY assignee")]
         return {
             "columns": [{"name": name, "tasks": columns[name]} for name in columns], "tenants": tenants,
             "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
@@ -640,6 +648,9 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     if blockers:
         names = ", ".join(f"{p['title']!r} ({p['id']}, status={p['status']})" for p in blockers)
         raise _conflict(f"Cannot move to 'ready': blocked by parent(s) not done — {names}")
+    if s == "archived" and kanban_db._task_status(conn, task_id) == "cancelled":
+        raise _conflict("cancelled tasks cannot be archived (archiving would release their children); "
+                        "delete the task instead")
     raise _conflict(_open_parent_refusal(conn, task_id, s) or f"status transition to {s!r} not valid from current state")
 
 

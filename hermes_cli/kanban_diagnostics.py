@@ -373,10 +373,10 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     retrying and the operator must intervene. Runtime callers derive the
     threshold from ``kanban.failure_limit`` so it doesn't lag the breaker.
 
-    Exempt: done/archived (a manual done ends no run, so the streak is history)
+    Exempt: done/archived/cancelled (a manual done ends no run, so the streak is history)
     and running (a retry in flight must not read as a current failure; re-fires
     if it fails too)."""
-    if _task_field(task, "status") in ("done", "archived", "running"):
+    if _task_field(task, "status") in ("done", "archived", "cancelled", "running"):
         return []
     threshold = _positive_int(_failure_threshold(cfg), 3)
     failure_limit = _positive_int(cfg.get("failure_limit"), threshold)
@@ -455,10 +455,10 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     earlier than ``repeated_failures`` for a crash-specific heads-up and
     suppresses itself when the unified rule is about to fire.
 
-    Exempt: done/archived (a manual done appends no completed run, so the
+    Exempt: done/archived/cancelled (a manual done appends no completed run, so the
     streak would be permanent) and running (an in-flight run has no outcome
     and wouldn't break the scan)."""
-    if _task_field(task, "status") in ("done", "archived", "running"):
+    if _task_field(task, "status") in ("done", "archived", "cancelled", "running"):
         return []
     # Unified rule will catch this — let it handle to avoid double fire.
     if (_task_field(task, "consecutive_failures", 0) or 0) >= int(_failure_threshold(cfg)):

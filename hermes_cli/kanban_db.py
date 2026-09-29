@@ -22,7 +22,7 @@ import sys
 import logging
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -100,7 +100,18 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 # --- Constants ---
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived", "cancelled"}
+
+# Statuses a task never leaves on its own: the dispatcher will not claim them,
+# ``recompute_ready`` will not promote them, and the notifier treats a
+# transition into one as the final word on the task.
+#
+# ``cancelled`` is deliberately NOT dependency-satisfying (see
+# ``DEPENDENCY_SATISFIED_STATUSES``): cancelling a lane must never push its
+# children into the work pool. Reusing ``archived`` for cancellation had exactly
+# that bug — ``/stop`` dispatched the work it was asked to kill.
+TERMINAL_STATUSES = frozenset({"done", "archived", "cancelled"})
+DEPENDENCY_SATISFIED_STATUSES = frozenset({"done", "archived"})
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
@@ -1325,7 +1336,7 @@ def create_task(
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
+            "AND status NOT IN ('archived', 'cancelled') "
             "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
         ).fetchone()
         if row:
@@ -1535,8 +1546,10 @@ def list_tasks(
         if val is not None:
             query += f" AND {col} = ?"
             params.append(val)
-    if not include_archived and status != "archived":
-        query += " AND status != 'archived'"
+    if not include_archived and status not in ("archived", "cancelled"):
+        # Cancelled work is terminal-and-hidden like archived: it shows only on
+        # request, never as live board content.
+        query += " AND status NOT IN ('archived', 'cancelled')"
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
@@ -3902,6 +3915,12 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         ).fetchone()
         if not row:
             return False
+        if row["status"] == "cancelled":
+            # ``archived`` satisfies a dependency and ``cancelled`` does not, so
+            # archiving cancelled work would promote every child ``/stop`` just
+            # stopped. Cancelled is already terminal and hidden; purge it with
+            # ``delete_archived_task`` instead.
+            return False
         was_running = row["status"] == "running"
         prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
         cur = conn.execute(
@@ -3928,6 +3947,312 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     return True
 
 
+# --- Cancellation (``/stop`` with ``kanban.cancel_on_stop``) ---
+
+@dataclass
+class CancelSourceResult:
+    """Outcome of :func:`cancel_tasks_for_notify_source`.
+
+    ``cancelled`` — moved to the terminal ``cancelled`` status.
+    ``detached`` — another conversation also awaits it: only this conversation's
+        subscription was removed and the work keeps running.
+    ``preserved`` — descendants that report ONLY to a different conversation;
+        left untouched.
+    ``orphaned`` — live descendants of cancelled work that another live lane
+        still feeds (fan-in). Parked in a sticky ``blocked`` with a visible
+        reason instead of waiting in ``todo`` forever on a parent that will
+        never finish.
+    ``workers_unverified`` — cancelled tasks whose worker process could not be
+        proven dead (other host, or it survived termination). The board row is
+        terminal either way; this keeps ``/stop`` from over-promising.
+    """
+
+    cancelled: list[str] = field(default_factory=list)
+    detached: list[str] = field(default_factory=list)
+    preserved: list[str] = field(default_factory=list)
+    orphaned: list[str] = field(default_factory=list)
+    workers_unverified: list[str] = field(default_factory=list)
+
+
+_SUB_MATCH_SQL = "LOWER(platform) = LOWER(?) AND chat_id = ? AND thread_id = ?"
+
+
+def _notify_sub_exists(conn: sqlite3.Connection, task_id: str, source: tuple) -> bool:
+    return conn.execute(
+        f"SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND {_SUB_MATCH_SQL} LIMIT 1",
+        (task_id, *source),
+    ).fetchone() is not None
+
+
+def _has_other_notify_subs(conn: sqlite3.Connection, task_id: str, source: tuple) -> bool:
+    """True when a conversation OTHER than ``source`` also awaits ``task_id``."""
+    return conn.execute(
+        f"SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND NOT ({_SUB_MATCH_SQL}) LIMIT 1",
+        (task_id, *source),
+    ).fetchone() is not None
+
+
+def _notify_sub_scope_rows(conn: sqlite3.Connection, source: tuple) -> list[str]:
+    """Nonterminal task ids subscribed by exactly ``source``. Platform compares
+    case-insensitively (as notifier routing does); chat and thread exactly, with
+    the table's empty-string thread convention, so a channel-level ``/stop``
+    cannot reach work that belongs to a child thread and vice versa."""
+    placeholders = ",".join("?" * len(TERMINAL_STATUSES))
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT s.task_id AS task_id
+          FROM kanban_notify_subs AS s JOIN tasks AS t ON t.id = s.task_id
+         WHERE LOWER(s.platform) = LOWER(?) AND s.chat_id = ? AND s.thread_id = ?
+           AND t.status NOT IN ({placeholders})
+         ORDER BY t.rowid
+        """,
+        (*source, *sorted(TERMINAL_STATUSES)),
+    ).fetchall()
+    return [row["task_id"] for row in rows]
+
+
+def _cancellation_plan(
+    conn: sqlite3.Connection, roots: list[str], *, is_foreign,
+) -> tuple[list[str], list[str], list[str]]:
+    """Walk the live descendant closure of ``roots``.
+
+    Returns ``(doomed, foreign, orphaned)``:
+
+    * ``doomed`` — ``roots`` plus every live descendant whose parents are ALL
+      terminal or doomed, ordered leaves-first (a child always precedes each of
+      its parents), so the board never shows a cancelled parent above a
+      still-running child. Cycles (only possible via direct DB edits; the API
+      refuses them) terminate because each id is visited once.
+    * ``foreign`` — descendants reporting to another conversation. Never
+      cancelled, and the walk does not descend through them.
+    * ``orphaned`` — live descendants with at least one doomed parent AND at
+      least one live parent outside the doomed set (fan-in). Not cancelled —
+      another lane still feeds them — but they can never be promoted while a
+      parent is ``cancelled``.
+    """
+    doomed: set[str] = set(roots)
+    foreign: list[str] = []
+    candidates: list[str] = []
+    seen: set[str] = set(roots)
+    frontier = list(roots)
+    while frontier:
+        parent_id = frontier.pop(0)
+        for child in conn.execute(
+            "SELECT l.child_id AS cid, t.status AS status FROM task_links l "
+            "JOIN tasks t ON t.id = l.child_id WHERE l.parent_id = ? ORDER BY t.rowid",
+            (parent_id,),
+        ).fetchall():
+            cid = child["cid"]
+            if cid in seen or child["status"] in TERMINAL_STATUSES:
+                continue  # finished work is history: never rewrite it
+            seen.add(cid)
+            if is_foreign(cid):
+                foreign.append(cid)
+                continue
+            candidates.append(cid)
+            frontier.append(cid)
+    # Fixed point: a candidate is doomed once every parent is terminal/doomed.
+    changed = True
+    while changed:
+        changed = False
+        for cid in candidates:
+            if cid in doomed:
+                continue
+            parents = conn.execute(
+                "SELECT t.id AS pid, t.status AS status FROM task_links l "
+                "JOIN tasks t ON t.id = l.parent_id WHERE l.child_id = ?", (cid,),
+            ).fetchall()
+            if all(p["pid"] in doomed or p["status"] in TERMINAL_STATUSES for p in parents):
+                doomed.add(cid)
+                changed = True
+    orphaned = [c for c in candidates if c not in doomed and _has_parent_in(conn, c, doomed)]
+    return _leaves_first(conn, doomed), foreign, orphaned
+
+
+def _has_parent_in(conn: sqlite3.Connection, task_id: str, ids: set[str]) -> bool:
+    return any(
+        r["parent_id"] in ids
+        for r in conn.execute("SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,))
+    )
+
+
+def _leaves_first(conn: sqlite3.Connection, ids: set[str]) -> list[str]:
+    """Topological order over ``ids`` with every child before its parents."""
+    remaining = set(ids)
+    ordered: list[str] = []
+    while remaining:
+        leaves = sorted(
+            tid for tid in remaining
+            if not any(
+                r["child_id"] in remaining
+                for r in conn.execute(
+                    "SELECT child_id FROM task_links WHERE parent_id = ?", (tid,))
+            )
+        )
+        if not leaves:  # a cycle (DB edit): break it deterministically
+            leaves = [sorted(remaining)[0]]
+        ordered.extend(leaves)
+        remaining.difference_update(leaves)
+    return ordered
+
+
+def _cancel_one_task(
+    conn: sqlite3.Connection, task_id: str, *, reason: str, signal_fn=None,
+) -> Optional[bool]:
+    """Move one task to terminal ``cancelled``, then stop its worker.
+
+    ``None`` when it was already terminal; ``True`` when cancelled and no worker
+    outlived the call; ``False`` when cancelled but a worker could not be proven
+    dead.
+
+    The status flip commits FIRST, so from that instant the dispatcher can
+    neither claim nor promote the task. A worker the dispatcher spawned for this
+    claim but had not yet recorded is handled on the dispatcher side:
+    ``_set_worker_pid`` refuses to stamp a PID onto a row whose claim is gone and
+    terminates that worker instead (see ``kanban_db_dispatch``). Because THIS
+    call cannot observe that, a claim with no recorded PID is reported as
+    unverified rather than as a clean stop.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or row["status"] in TERMINAL_STATUSES:
+            return None
+        prev = (row["worker_pid"], row["claim_lock"], row["worker_started_at"])
+        placeholders = ",".join("?" * len(TERMINAL_STATUSES))
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'cancelled', claim_lock = NULL, claim_expires = NULL, "
+            "    worker_pid = NULL, worker_started_at = NULL, block_kind = NULL "
+            f"WHERE id = ? AND status NOT IN ({placeholders})",
+            (task_id, *sorted(TERMINAL_STATUSES)),
+        )
+        if cur.rowcount != 1:
+            return None
+        run_id = _end_run(conn, task_id, outcome="cancelled", status="cancelled", summary=reason)
+        _append_event(conn, task_id, "cancelled",
+                      {"reason": reason, "prev_lock": prev[1], "prev_pid": prev[0]}, run_id=run_id)
+
+    verified = True
+    pid, lock, started = prev
+    if pid:
+        termination = _terminate_reclaimed_worker(pid, lock, signal_fn=signal_fn, started_at=started)
+        if not termination.get("host_local"):
+            _log.warning("kanban cancel: task %s worker pid %s is not host-local "
+                         "(claim_lock=%s) — cannot terminate from this host", task_id, pid, lock)
+            verified = False
+        elif not termination.get("terminated"):
+            _log.warning("kanban cancel: task %s worker pid %s survived termination", task_id, pid)
+            verified = False
+        with write_txn(conn):
+            _append_event(conn, task_id, "cancel_worker_termination", termination, run_id=run_id)
+    elif lock:
+        # Claimed but no PID recorded yet: the dispatcher is between spawn and
+        # _set_worker_pid. It will find the claim gone and kill its own child,
+        # but THIS call cannot prove that happened — never report a clean stop.
+        verified = False
+    _cleanup_workspace(conn, task_id)
+    return verified
+
+
+def _detach_notify_sub(conn: sqlite3.Connection, task_id: str, source: tuple, *, reason: str) -> None:
+    """Drop this conversation's subscription, leaving the task running."""
+    with write_txn(conn):
+        conn.execute(f"DELETE FROM kanban_notify_subs WHERE task_id = ? AND {_SUB_MATCH_SQL}",
+                     (task_id, *source))
+        _append_event(conn, task_id, "notify_detached", {
+            "reason": reason, "platform": source[0], "chat_id": source[1], "thread_id": source[2]})
+
+
+def _park_orphan(conn: sqlite3.Connection, task_id: str, *, cancelled_parents: list[str], reason: str) -> bool:
+    """Park a fan-in descendant whose dependency was cancelled in a STICKY
+    ``blocked`` (``needs_input``): it can never become ready on its own while a
+    parent is cancelled, so an operator must decide (unlink, re-run the lane,
+    or cancel it). A running descendant is left alone — it already has its
+    inputs."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input' "
+            "WHERE id = ? AND status IN ('todo', 'ready', 'triage', 'scheduled')", (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "blocked", {
+            "reason": f"dependency cancelled: {', '.join(cancelled_parents)} ({reason})",
+            "kind": "needs_input", "cancelled_parents": cancelled_parents, "sticky": True,
+        })
+    return True
+
+
+def cancel_tasks_for_notify_source(
+    conn: sqlite3.Connection, *, platform: str, chat_id: str,
+    thread_id: Optional[str] = None, reason: Optional[str] = None, signal_fn=None,
+) -> CancelSourceResult:
+    """Stop the Kanban work routed back to one gateway conversation.
+
+    The Kanban half of ``/stop``: interrupting the gateway's own agent turn left
+    dispatched workers running and reporting into a conversation the operator
+    had already stopped. Scoping is by notify subscription — the key the
+    notifier delivers on — so work can only be stopped from a conversation it
+    would have replied to.
+
+    1. **Shared work is detached, never destroyed.** A task (root or
+       descendant) another conversation also awaits keeps running; only this
+       conversation's subscription is removed.
+    2. **Descendants die only when nothing else feeds them.** A child whose
+       parents are all dead/dying is cancelled, leaves-first. ``cancelled`` does
+       NOT satisfy a dependency, so nothing is promoted. A fan-in child another
+       live lane still feeds is parked in a sticky block with a reason instead
+       of silently waiting forever.
+    3. **Status first, kill second** — see :func:`_cancel_one_task`.
+    """
+    source = (platform, str(chat_id), thread_id or "")
+    note = reason or "cancelled by operator /stop"
+    result = CancelSourceResult()
+
+    def _foreign(task_id: str) -> bool:
+        return _has_other_notify_subs(conn, task_id, source)
+
+    roots: list[str] = []
+    for task_id in _notify_sub_scope_rows(conn, source):
+        if _foreign(task_id):
+            _detach_notify_sub(conn, task_id, source, reason=note)
+            result.detached.append(task_id)
+        else:
+            roots.append(task_id)
+    if not roots:
+        return result
+
+    doomed, foreign, orphaned = _cancellation_plan(conn, roots, is_foreign=_foreign)
+    for task_id in foreign:
+        if _notify_sub_exists(conn, task_id, source):
+            _detach_notify_sub(conn, task_id, source, reason=note)
+            result.detached.append(task_id)
+        else:
+            result.preserved.append(task_id)
+
+    for task_id in doomed:
+        verified = _cancel_one_task(conn, task_id, reason=note, signal_fn=signal_fn)
+        if verified is None:
+            continue
+        result.cancelled.append(task_id)
+        if verified is False:
+            result.workers_unverified.append(task_id)
+        # Nothing will ever be delivered on this conversation's row again.
+        with write_txn(conn):
+            conn.execute(f"DELETE FROM kanban_notify_subs WHERE task_id = ? AND {_SUB_MATCH_SQL}",
+                         (task_id, *source))
+
+    cancelled = set(result.cancelled)
+    for task_id in orphaned:
+        dead = [r["parent_id"] for r in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,)) if r["parent_id"] in cancelled]
+        if dead and _park_orphan(conn, task_id, cancelled_parents=dead, reason=note):
+            result.orphaned.append(task_id)
+    return result
+
+
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
@@ -3936,10 +4261,11 @@ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
 
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete an ARCHIVED task (+ related rows); anything else must be
-    archived first so data loss takes two deliberate actions."""
+    """Hard-delete an ARCHIVED or CANCELLED task (+ related rows); live work must
+    be archived first so data loss takes two deliberate actions. Cancelled work
+    already took the first action (and cannot be archived — see archive_task)."""
     with write_txn(conn):
-        if _task_status(conn, task_id) != "archived":
+        if _task_status(conn, task_id) not in ("archived", "cancelled"):
             return False
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
@@ -4207,7 +4533,7 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     by_status: dict[str, int] = {}
     for row in conn.execute(
         "SELECT status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' GROUP BY status"
+        "WHERE status NOT IN ('archived', 'cancelled') GROUP BY status"
     ):
         by_status[row["status"]] = int(row["n"])
 
@@ -4235,7 +4561,7 @@ def _counts_by_assignee(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
     counts: dict[str, dict[str, int]] = {}
     for row in conn.execute(
         "SELECT assignee, status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' AND assignee IS NOT NULL "
+        "WHERE status NOT IN ('archived', 'cancelled') AND assignee IS NOT NULL "
         "GROUP BY assignee, status"
     ):
         counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
@@ -4305,7 +4631,7 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived', 'cancelled'))", (cutoff,),
         )
     return int(cur.rowcount or 0)
 

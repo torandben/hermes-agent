@@ -1022,7 +1022,7 @@ class GatewayBusySessionMixin:
             quick_key, source, interrupt_reason=_INTERRUPT_REASON_STOP, invalidation_reason="stop_command",
         )
         logger.info("STOP for session %s — agent interrupted, session lock released", quick_key)
-        return EphemeralReply(t("gateway.stop.stopped"))
+        return await self._stop_reply_with_kanban("gateway.stop.stopped", source=source)
 
     async def _busy_new_command(self, event: MessageEvent, quick_key: str, source):
         # /reset and /new bypass the running-agent guard (else they'd queue as user text and replay

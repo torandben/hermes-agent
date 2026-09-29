@@ -33,9 +33,10 @@ def _kbn():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "cancelled", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
 # Kinds that hand a decision back to the origin, which must take a turn.
-# status/archived/unblocked are bookkeeping.
+# status/archived/cancelled/unblocked are bookkeeping (cancelled is the operator's
+# own final word: it is reported, never handed back as work to resume).
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
 
 
@@ -469,6 +470,10 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "review_requested": _fmt_review_requested,
     "changes_requested": _fmt_changes_requested,
     "block_loop_detected": _fmt_block_loop_detected,
+    "cancelled": lambda ev, n: (
+        t("gateway.kanban.ping.cancelled", head=n.head, reason=_clip(ev, "reason", "gateway.kanban.ping.reason_suffix", 160)),
+        None, None,
+    ),
 }
 
 
@@ -803,6 +808,6 @@ class _KanbanNotification:
         await self.advance()
         if not is_push:
             self.clear_failures()
-        # Unsubscribe only on archive; ``done`` is reversible.
-        if self.task and self.task.status == "archived":
+        # Unsubscribe only on archive/cancel; ``done`` is reversible.
+        if self.task and self.task.status in ("archived", "cancelled"):
             await self.unsub()

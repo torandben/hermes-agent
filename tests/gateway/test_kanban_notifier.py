@@ -459,6 +459,54 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
         conn.close()
 
 
+def test_cancelled_task_notifies_its_other_subscriber_once_and_unsubscribes(tmp_path, monkeypatch):
+    """A task cancelled by ANOTHER path (e.g. /stop in a descendant's lane, or a
+    direct cancel) must tell a remaining subscriber the work is dead — exactly
+    once, without waking it — and then drop the row so it is not polled forever."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "cancel-notify.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="lane work", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb._cancel_one_task(conn, tid, reason="operator /stop") is True
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "cancel" in adapter.sent[0]["text"].lower()
+    assert adapter.handled == [], "a cancellation is final — it must not wake the origin agent"
+    conn = kbc.connect()
+    try:
+        assert kbn.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
+
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1, "the cancellation must not replay"
+
+
+def test_stale_cancelled_subscriptions_are_purged(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "cancel-gc.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._cancel_one_task(conn, tid, reason="x")
+        conn.execute("UPDATE task_events SET created_at = 1")
+        conn.execute("UPDATE tasks SET created_at = 1")
+        conn.commit()
+        assert kbn.purge_stale_done_notify_subs(conn, max_age_days=1) == 1
+    finally:
+        conn.close()
+
+
 def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     db_path = tmp_path / "chat-type-wakeup.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

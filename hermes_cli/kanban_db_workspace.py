@@ -310,11 +310,16 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
     children are now all done/archived/failed/cancelled (called after each
     child completes).
 
+    The PARENT must itself be terminal: a child reaching a terminal state (e.g.
+    cancelled by ``/stop``) says nothing about whether the parent's own worker
+    is still running in that directory.
+
     See #33774.
     """
     try:
         parents = conn.execute(
-            "SELECT parent_id FROM task_links WHERE child_id = ?",
+            "SELECT l.parent_id AS parent_id FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status IN ('done', 'archived', 'cancelled')",
             (task_id,),
         ).fetchall()
         for (parent_id,) in parents:
