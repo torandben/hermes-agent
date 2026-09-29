@@ -4219,8 +4219,9 @@ def cancel_tasks_for_notify_source(
     def _foreign(task_id: str) -> bool:
         return _has_other_notify_subs(conn, task_id, source)
 
+    subscribed_scope = _notify_sub_scope_rows(conn, source)
     subscribed: list[str] = []
-    for task_id in _notify_sub_scope_rows(conn, source):
+    for task_id in subscribed_scope:
         if _foreign(task_id):
             _detach_notify_sub(conn, task_id, source, reason=note)
             result.detached.append(task_id)
@@ -4245,9 +4246,10 @@ def cancel_tasks_for_notify_source(
                 "JOIN tasks t ON t.id = l.parent_id WHERE l.child_id = ?", (task_id,),
             ).fetchall()
             # A directly subscribed child may be stopped even while an
-            # out-of-scope parent runs. Only inherited descendants of another
-            # subscribed task need the fan-in check.
-            inherited = any(p["pid"] in subscribed for p in parents)
+            # out-of-scope parent runs. But a child inherited from *any*
+            # subscribed parent is not independent — including a shared parent
+            # that was already detached above and therefore is not in roots.
+            inherited = any(p["pid"] in subscribed_scope for p in parents)
             if not inherited or all(p["pid"] in roots or p["status"] in TERMINAL_STATUSES for p in parents):
                 roots.append(task_id)
                 pending.remove(task_id)

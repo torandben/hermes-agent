@@ -278,6 +278,28 @@ def test_inherited_notify_subscription_does_not_cancel_fan_in(kanban_home):
         conn.close()
 
 
+def test_inherited_child_of_shared_parent_is_not_cancelled(kanban_home):
+    """A parent shared with another conversation stays live. Its child inherited
+    our subscription before the second subscriber was added to the parent;
+    /stop must not mistake that child for an independent root."""
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="shared parent", assignee="w")
+        _sub(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="w", parents=[parent])
+        _sub(conn, parent, chat_id="chanB", thread_id="thr9")
+        assert any(s["chat_id"] == "chan1" for s in kbn.list_notify_subs(conn, child))
+
+        result = _cancel(conn)
+
+        assert parent in result.detached
+        assert child not in result.cancelled
+        assert kb.get_task(conn, parent).status != "cancelled"
+        assert kb.get_task(conn, child).status != "cancelled"
+    finally:
+        conn.close()
+
+
 def test_orphaned_fan_in_is_released_by_explicit_unblock(kanban_home):
     """The parked join is an operator decision, and unblocking it works once the
     operator removes the dead dependency."""
