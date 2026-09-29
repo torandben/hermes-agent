@@ -9,6 +9,7 @@ Verifies:
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -604,6 +605,134 @@ def test_create_happy_path(worker_env):
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+# --- Leaf-only specialist workers (kanban.allow_worker_child_tasks) ---
+
+@pytest.fixture(autouse=True)
+def _reset_kanban_policy_caches():
+    """The fan-out verdict and the registry's check_fn cache are process-global;
+    clear both on the way in AND out so a cached verdict cannot leak across tests."""
+    from tools import kanban_tools as kt
+    from tools.registry import invalidate_check_fn_cache
+
+    kt._reset_worker_child_tasks_policy_cache()
+    invalidate_check_fn_cache()
+    yield
+    kt._reset_worker_child_tasks_policy_cache()
+    invalidate_check_fn_cache()
+
+
+def _make_leaf_only(home):
+    """Leaf-only via a REAL config.yaml read through the real load_config/cfg_get,
+    so a wrong config call form fails the test instead of being mirrored by a mock."""
+    from tools import kanban_tools as kt
+
+    (home / "config.yaml").write_text(
+        "kanban:\n  allow_worker_child_tasks: false\n", encoding="utf-8")
+    kt._reset_worker_child_tasks_policy_cache()
+
+
+def test_worker_create_rejected_when_child_tasks_disabled(worker_env):
+    from pathlib import Path
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    _make_leaf_only(Path(os.environ["HERMES_HOME"]))
+    out = json.loads(kt._handle_create(
+        {"title": "must not exist", "assignee": "peer", "parents": [worker_env]}))
+
+    assert out.get("ok") is not True
+    assert "child task creation is disabled" in out.get("error", "").lower()
+    conn = kbc.connect()
+    try:
+        assert not any(t.title == "must not exist" for t in kb.list_tasks(conn, limit=50))
+    finally:
+        conn.close()
+
+
+def test_worker_create_allowed_by_default(worker_env):
+    """Sibling path through _handle_create: absent config, workers still fan out."""
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create(
+        {"title": "allowed child", "assignee": "peer", "parents": [worker_env]}))
+    assert out.get("ok") is True, out
+
+
+def test_worker_child_policy_fails_closed_without_pinning_failure(monkeypatch, worker_env):
+    """An unreadable config denies THIS call, but a transient error must not pin
+    the worker to leaf-only for the rest of the process."""
+    from tools import kanban_tools as kt
+
+    def _boom():
+        raise RuntimeError("config.yaml is mid-write")
+
+    monkeypatch.setattr(kt, "load_config", _boom)
+    assert kt._worker_child_tasks_allowed() is False
+
+    monkeypatch.setattr(kt, "load_config",
+                        lambda: {"kanban": {"allow_worker_child_tasks": True}})
+    assert kt._worker_child_tasks_allowed() is True
+
+
+def test_worker_child_policy_success_is_memoized(monkeypatch, worker_env):
+    """A successful read is stable, so the tool schema cannot flip mid-conversation."""
+    from tools import kanban_tools as kt
+
+    calls = {"n": 0}
+
+    def _counting_load():
+        calls["n"] += 1
+        return {"kanban": {"allow_worker_child_tasks": False}}
+
+    monkeypatch.setattr(kt, "load_config", _counting_load)
+    first = kt._worker_child_tasks_allowed()
+    monkeypatch.setattr(kt, "load_config",
+                        lambda: {"kanban": {"allow_worker_child_tasks": True}})
+    second = kt._worker_child_tasks_allowed()
+
+    assert (first, second, calls["n"]) == (False, False, 1)
+
+
+def test_worker_child_policy_cache_is_scoped_per_profile(monkeypatch, worker_env, tmp_path):
+    """A multiplex gateway serves several homes from one process: profile A's
+    verdict must not answer for profile B."""
+    from tools import kanban_tools as kt
+
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    for home, allowed in ((home_a, "false"), (home_b, "true")):
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            f"kanban:\n  allow_worker_child_tasks: {allowed}\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    assert kt._worker_child_tasks_allowed() is False
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    assert kt._worker_child_tasks_allowed() is True
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    assert kt._worker_child_tasks_allowed() is False
+
+
+def test_worker_create_hidden_when_child_tasks_disabled(worker_env):
+    """Leaf-only workers lose kanban_create from the schema; siblings stay."""
+    from pathlib import Path
+
+    import tools.kanban_tools  # noqa: F401  (registration)
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    _make_leaf_only(Path(os.environ["HERMES_HOME"]))
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {item["function"].get("name") for item in schema if "function" in item}
+
+    assert "kanban_show" in names
+    assert "kanban_complete" in names, "a leaf worker must still close its task"
+    assert "kanban_create" not in names
 
 
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])

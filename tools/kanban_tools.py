@@ -102,6 +102,74 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _visible(to_env_worker=False)
 
 
+# Successful policy reads, keyed by Hermes home. A multiplex gateway serves several
+# profiles from one process, so a single process-global verdict would leak one
+# profile's rule into another.
+_WORKER_CHILD_TASKS_POLICY: dict[str, bool] = {}
+
+
+def _worker_child_policy_cache_key() -> str:
+    from hermes_constants import hermes_home_key
+
+    return hermes_home_key()
+
+
+def _worker_child_tasks_allowed() -> bool:
+    """Return the active profile's dispatcher-worker fan-out policy.
+
+    Existing profiles keep the historical behaviour (allowed). Operators make a
+    specialist profile leaf-only with ``kanban.allow_worker_child_tasks: false``
+    in ``config.yaml``. The policy applies only while the profile runs as a
+    dispatcher-owned worker; an explicitly configured orchestrator can still
+    create routed work.
+
+    A successful read is memoized per Hermes home so the verdict (which drives a
+    ``check_fn``) stays stable for the life of a conversation. A failed read
+    fails CLOSED for this call only and is NOT memoized: one transient config
+    error at process start must not pin a legitimate worker to leaf-only forever.
+    """
+    try:
+        key = _worker_child_policy_cache_key()
+    except Exception:
+        key = None
+    if key is not None and key in _WORKER_CHILD_TASKS_POLICY:
+        return _WORKER_CHILD_TASKS_POLICY[key]
+    try:
+        raw = cfg_get(load_config(), "kanban", "allow_worker_child_tasks", default=True)
+    except Exception:
+        # Fail CLOSED: this gate exists to stop runaway fan-out, so "could not
+        # read the rule" is not a reason to permit what the rule may forbid.
+        logger.debug(
+            "kanban: allow_worker_child_tasks unreadable — denying child task "
+            "creation for this call", exc_info=True)
+        return False
+    if isinstance(raw, str):
+        allowed = raw.strip().lower() not in {"false", "0", "no", "off"}
+    else:
+        allowed = bool(raw)
+    if key is not None:
+        _WORKER_CHILD_TASKS_POLICY[key] = allowed
+    return allowed
+
+
+def _reset_worker_child_tasks_policy_cache() -> None:
+    """Clear the memoized fan-out policy. For tests only."""
+    _WORKER_CHILD_TASKS_POLICY.clear()
+
+
+def _is_leaf_only_worker() -> bool:
+    return bool(
+        os.environ.get("HERMES_KANBAN_TASK")
+        and _is_dispatcher_owned_worker()
+        and not _worker_child_tasks_allowed())
+
+
+@no_cache_check_fn
+def _check_kanban_create_mode() -> bool:
+    """``kanban_create`` gate: lifecycle visibility, minus leaf-only workers."""
+    return _check_kanban_mode() and not _is_leaf_only_worker()
+
+
 # --- Shared helpers: validation failures raise _Reject; _kanban_handler renders it ---
 
 # Worker tools that terminate or transition a run's ownership. An unbound worker
@@ -1033,6 +1101,9 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
 def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
     _reject_delegated_child_mutation("kanban_create")
+    _check(not _is_leaf_only_worker(),
+           "kanban_create refused: child task creation is disabled for this worker "
+           "profile. Return findings to the orchestrator instead.")
     title = _require_text(args, "title")
     assignee = args.get("assignee")
     _check(assignee, "assignee is required — name the profile that should execute this "
@@ -1217,6 +1288,11 @@ _TOOLS = (
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
-    _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode
+    if _name in _ORCHESTRATOR_TOOLS:
+        _gate = _check_kanban_orchestrator_mode
+    elif _name == "kanban_create":
+        _gate = _check_kanban_create_mode
+    else:
+        _gate = _check_kanban_mode
     registry.register(name=_name, toolset="kanban", schema=_sch, handler=_handler, emoji=_emoji,
                       check_fn=_gate)
