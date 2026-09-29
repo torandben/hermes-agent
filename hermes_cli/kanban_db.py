@@ -4260,6 +4260,26 @@ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 
+def _park_children_of_deleted_cancelled(conn: sqlite3.Connection, task_id: str) -> None:
+    """Deleting drops ``task_links``, so a live child of a CANCELLED task would
+    lose its only unsatisfied parent and be promoted by ``recompute_ready`` —
+    purging a cancelled lane must not dispatch the work /stop left un-run.
+    Park each such child sticky (as :func:`_park_orphan` does). Runs inside the
+    caller's write txn, before the links are removed."""
+    if _task_status(conn, task_id) != "cancelled":
+        return
+    for row in conn.execute(
+        "SELECT t.id FROM task_links l JOIN tasks t ON t.id = l.child_id "
+        "WHERE l.parent_id = ? AND t.status IN ('todo', 'ready', 'triage', 'scheduled')",
+        (task_id,),
+    ).fetchall():
+        conn.execute("UPDATE tasks SET status = 'blocked', block_kind = 'needs_input' WHERE id = ?", (row["id"],))
+        _append_event(conn, row["id"], "blocked", {
+            "reason": f"dependency cancelled and deleted: {task_id}",
+            "kind": "needs_input", "cancelled_parents": [task_id], "sticky": True,
+        })
+
+
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete an ARCHIVED or CANCELLED task (+ related rows); live work must
     be archived first so data loss takes two deliberate actions. Cancelled work
@@ -4267,6 +4287,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         if _task_status(conn, task_id) not in ("archived", "cancelled"):
             return False
+        _park_children_of_deleted_cancelled(conn, task_id)
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
@@ -4275,6 +4296,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and its related rows in one txn; False when not found."""
     with write_txn(conn):
+        _park_children_of_deleted_cancelled(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False

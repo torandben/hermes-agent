@@ -644,6 +644,55 @@ def test_cancelled_task_can_be_hard_deleted(kanban_home):
         conn.close()
 
 
+def _cancelled_parent_with_preserved_child(conn):
+    """/stop cancels ``parent``; ``child`` reports elsewhere so it is preserved
+    in ``todo`` behind a parent that will never finish."""
+    parent = kb.create_task(conn, title="parent", assignee="w")
+    child = kb.create_task(conn, title="child", assignee="w", parents=[parent])
+    _sub(conn, parent, chat_id="chan1", thread_id="thr1")
+    _sub(conn, child, chat_id="chanB", thread_id="thr9")
+    result = _cancel(conn, chat_id="chan1", thread_id="thr1")
+    assert result.cancelled == [parent] and child in result.preserved
+    return parent, child
+
+
+@pytest.mark.parametrize("delete", ["delete_archived_task", "delete_task"])
+def test_deleting_cancelled_parent_does_not_release_child(kanban_home, delete):
+    """Round-3 BLOCKER. Deleting drops the task_links row, so the child lost its
+    only unsatisfied parent and recompute_ready promoted it: purging a cancelled
+    lane (CLI ``archive --rm``, dashboard DELETE) dispatched work /stop had
+    deliberately left un-run. The child must be parked for an operator instead."""
+    conn = kbc.connect()
+    try:
+        parent, child = _cancelled_parent_with_preserved_child(conn)
+
+        assert getattr(kb, delete)(conn, parent) is True
+        kb.recompute_ready(conn)
+
+        task = kb.get_task(conn, child)
+        assert task.status == "blocked", "must not become dispatchable"
+        assert task.block_kind == "needs_input", "sticky: only an operator releases it"
+        reasons = [e.payload.get("reason", "") for e in kb.list_events(conn, child) if e.kind == "blocked"]
+        assert any(parent in r for r in reasons), reasons
+    finally:
+        conn.close()
+
+
+def test_deleting_non_cancelled_parent_still_releases_child(kanban_home):
+    """Guard against over-reach: deleting an ordinary (archived) parent keeps
+    the pre-existing behaviour of letting the child proceed."""
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="parent", assignee="w")
+        child = kb.create_task(conn, title="child", assignee="w", parents=[parent])
+        assert kb.archive_task(conn, parent) is True
+        assert kb.delete_archived_task(conn, parent) is True
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "ready"
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # ``cancelled`` adopted across the board, not just in the cancel path
 # ---------------------------------------------------------------------------
