@@ -453,6 +453,7 @@ gateway:
     kanban_preserved: "↪️ {count} tarefa(s) de acompanhamento reportam a outra conversa — continuam em execução."
     kanban_orphaned: "⏸️ {count} tarefa(s) também dependem de outra linha ativa — estacionadas como bloqueadas até um operador decidir."
     kanban_unverified: "⚠️ {count} tarefa(s) foram canceladas, mas não foi possível confirmar a parada do processo — verifique `hermes kanban show <id>`."
+    kanban_failed: "⚠️ Falha ao cancelar Kanban em {count} quadro(s)/tarefa(s) — parte do trabalho pode continuar. Verifique o quadro."
     kanban_pending: "⏳ O cancelamento do Kanban ainda está em andamento após {seconds}s e terminará em segundo plano — verifique `hermes kanban list`."
   title:
     db_unavailable: "Base de dados de sessões indisponível."

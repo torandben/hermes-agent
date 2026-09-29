@@ -453,6 +453,7 @@ gateway:
     kanban_preserved: "↪️ {count} 件の後続タスクは別の会話に報告します — 実行を継続します。"
     kanban_orphaned: "⏸️ {count} 件のタスクは別の稼働中レーンにも依存しています — オペレーターの判断まで blocked で保留しました。"
     kanban_unverified: "⚠️ {count} 件のタスクはキャンセル済みですが、ワーカープロセスの停止を確認できませんでした — `hermes kanban show <id>` を確認してください。"
+    kanban_failed: "⚠️ {count} 件のボード/タスクで Kanban のキャンセルに失敗しました。作業が続いている可能性があります。ボードを確認してください。"
     kanban_pending: "⏳ Kanban のキャンセルは {seconds} 秒経過後も処理中で、バックグラウンドで完了します — `hermes kanban list` を確認してください。"
   title:
     db_unavailable: "セッションデータベースは利用できません。"

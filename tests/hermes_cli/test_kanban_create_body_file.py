@@ -60,6 +60,47 @@ def test_body_file_stores_body_verbatim_with_trailing_flags_intact(kanban_home, 
     assert _create(["PROBE", "--body", "inline", "--body-file", str(f)]) == 2
 
 
+def test_leaf_only_dispatcher_worker_cannot_bypass_via_cli(kanban_home, monkeypatch, capsys):
+    """A worker with terminal access cannot evade the tool's leaf-only guard by
+    running `hermes kanban create` directly."""
+    from tools import kanban_tools as kt
+
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  allow_worker_child_tasks: false\n", encoding="utf-8")
+    kt._reset_worker_child_tasks_policy_cache()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+
+    assert _create(["must not exist"]) != 0
+    assert "child task creation is disabled" in capsys.readouterr().err.lower()
+    with kbc.connect_closing() as conn:
+        assert kb.list_tasks(conn) == []
+
+
+def test_dispatcher_worker_cli_create_allowed_by_default(kanban_home, monkeypatch):
+    """The default permits workers that were not configured as leaf-only."""
+    from tools import kanban_tools as kt
+    kt._reset_worker_child_tasks_policy_cache()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+    assert _create(["allowed child"]) == 0
+
+
+def test_leaf_only_worker_cannot_use_swarm_cli(kanban_home, monkeypatch, capsys):
+    """`swarm` also creates tasks and must honor the same leaf-only policy."""
+    from tools import kanban_tools as kt
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  allow_worker_child_tasks: false\n", encoding="utf-8")
+    kt._reset_worker_child_tasks_policy_cache()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+    root = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(root.add_subparsers())
+    args = root.parse_args(["kanban", "swarm", "a goal", "--worker", "peer:a job",
+                            "--verifier", "peer", "--synthesizer", "peer"])
+    assert kc._cmd_swarm(args) != 0
+    assert "child task creation is disabled" in capsys.readouterr().err.lower()
+    with kbc.connect_closing() as conn:
+        assert kb.list_tasks(conn) == []
+
+
 def test_body_file_dash_reads_stdin(kanban_home, monkeypatch, capsys):
     assert _create(["PROBE", "--body-file", "-"], monkeypatch, stdin=BODY) == 0
     capsys.readouterr()

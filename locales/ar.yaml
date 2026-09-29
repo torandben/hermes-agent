@@ -453,6 +453,7 @@ gateway:
     kanban_preserved: "↪️ {count} مهمة متابعة ترفع تقاريرها إلى محادثة أخرى — تبقى قيد التشغيل."
     kanban_orphaned: "⏸️ {count} مهمة تعتمد أيضًا على مسار نشط آخر — أُوقفت كمحظورة حتى يقرر المشغّل."
     kanban_unverified: "⚠️ عُلّمت {count} مهمة كملغاة، لكن تعذّر تأكيد توقف عملية العامل — راجع `hermes kanban show <id>`."
+    kanban_failed: "⚠️ فشل إلغاء Kanban في {count} لوحة/مهمة — قد يستمر بعض العمل. تحقق من اللوحة."
     kanban_pending: "⏳ لا يزال إلغاء Kanban جاريًا بعد {seconds} ث وسيكتمل في الخلفية — راجع `hermes kanban list`."
   title:
     db_unavailable: "قاعدة بيانات الجلسات غير متاحة."

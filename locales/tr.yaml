@@ -453,6 +453,7 @@ gateway:
     kanban_preserved: "↪️ {count} takip görevi başka bir konuşmaya rapor veriyor — çalışmaya devam ediyor."
     kanban_orphaned: "⏸️ {count} görev başka bir aktif hatta da bağlı — bir operatör karar verene kadar engellendi olarak bekletiliyor."
     kanban_unverified: "⚠️ {count} görev iptal edildi ancak çalışan süreçlerinin durduğu doğrulanamadı — `hermes kanban show <id>` komutunu kontrol edin."
+    kanban_failed: "⚠️ Kanban iptali {count} pano/görev için başarısız oldu — bazı işler hâlâ çalışıyor olabilir. Panoyu kontrol edin."
     kanban_pending: "⏳ Kanban iptali {seconds} sn sonra hâlâ sürüyor ve arka planda tamamlanacak — `hermes kanban list` komutunu kontrol edin."
   title:
     db_unavailable: "Oturum veritabanı kullanılamıyor."

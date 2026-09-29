@@ -493,6 +493,7 @@ gateway:
     kanban_preserved: "↪️ {count} tâche(s) de suivi rendent compte à une autre conversation — elles continuent."
     kanban_orphaned: "⏸️ {count} tâche(s) dépendent aussi d'une autre voie active — mises en attente (bloquées) jusqu'à décision d'un opérateur."
     kanban_unverified: "⚠️ {count} tâche(s) ont été annulées, mais l'arrêt de leur processus n'a pas pu être confirmé — vérifiez `hermes kanban show <id>`."
+    kanban_failed: "⚠️ Échec de l’annulation Kanban pour {count} tableau(x)/tâche(s) — certaines tâches peuvent encore tourner. Vérifiez le tableau."
     kanban_pending: "⏳ L'annulation Kanban est toujours en cours après {seconds} s et se terminera en arrière-plan — vérifiez `hermes kanban list`."
   title:
     db_unavailable: "Base de données des sessions indisponible."

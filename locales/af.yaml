@@ -453,6 +453,7 @@ gateway:
     kanban_preserved: "↪️ {count} opvolgtaak/-take rapporteer aan 'n ander gesprek — loop steeds."
     kanban_orphaned: "⏸️ {count} taak/take hang ook van 'n ander aktiewe baan af — as geblokkeer geparkeer totdat 'n operateur besluit."
     kanban_unverified: "⚠️ {count} taak/take is gekanselleer, maar dit kon nie bevestig word dat hul werkerproses gestop het nie — kyk na `hermes kanban show <id>`."
+    kanban_failed: "⚠️ Kanban-kansellasie het vir {count} bord/taak(e) misluk — sommige werk kan nog loop. Kontroleer die bord."
     kanban_pending: "⏳ Kanban-kansellasie loop steeds ná {seconds}s en sal in die agtergrond klaarmaak — kyk na `hermes kanban list`."
   title:
     db_unavailable: "Sessie-databasis is nie beskikbaar nie."

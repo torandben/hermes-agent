@@ -331,8 +331,23 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _leaf_only_worker_create_refusal() -> bool:
+    """Share the profile-scoped fail-closed policy used by kanban_create.
+    Terminal-capable workers must not bypass it through the CLI."""
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+
+    if not os.environ.get("HERMES_KANBAN_TASK") or not is_dispatcher_owned_worker_context():
+        return False
+    from tools.kanban_tools import _worker_child_tasks_allowed
+
+    return not _worker_child_tasks_allowed()
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     from agent.delegation_context import is_dispatcher_owned_worker_context
+
+    if _leaf_only_worker_create_refusal():
+        return _err("kanban create refused: child task creation is disabled for this worker profile", 2)
 
     body = args.body
     body_file = getattr(args, "body_file", None)
@@ -392,6 +407,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
 
 
 def _cmd_swarm(args: argparse.Namespace) -> int:
+    if _leaf_only_worker_create_refusal():
+        return _err("kanban swarm refused: child task creation is disabled for this worker profile", 2)
     try:
         workers = [ks.parse_worker_arg(raw) for raw in (args.worker or [])]
     except ValueError as exc:

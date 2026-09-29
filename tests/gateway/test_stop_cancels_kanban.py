@@ -248,7 +248,34 @@ async def test_broken_kanban_db_does_not_break_stop(hermes_home, monkeypatch):
     text = await _stop(runner, source)
 
     assert "Stopped" in text
-    assert "Kanban" not in text
+    assert "Kanban" in text and "failed" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_worker_termination_error_does_not_claim_full_stop(hermes_home, monkeypatch):
+    """An OS termination exception after a committed status flip must not
+    disappear behind a plain 'Stopped' reply or leave sibling work running."""
+    _enable_cancel_on_stop(hermes_home)
+    a = _seed_task(title="worker A")
+    b = _seed_task(title="sibling B")
+    conn = kbc.connect()
+    try:
+        conn.execute("UPDATE tasks SET status='running', claim_lock=?, worker_pid=424242 "
+                     "WHERE id=?", (kb._host_prefix() + "lock", a))
+        conn.commit()
+    finally:
+        conn.close()
+
+    def denied(*args, **kwargs):
+        raise PermissionError("OpenProcess denied")
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", denied)
+    runner, source = _runner()
+    text = await _stop(runner, source)
+
+    assert _status(a) == "cancelled"
+    assert _status(b) == "cancelled"
+    assert "Kanban" in text and ("confirm" in text or "failed" in text.lower())
 
 
 @pytest.mark.asyncio

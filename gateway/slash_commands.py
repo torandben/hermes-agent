@@ -538,7 +538,9 @@ class GatewaySlashCommandsMixin(
         try:
             boards = kb.list_boards(include_archived=False) or [{"slug": kb.DEFAULT_BOARD}]
         except Exception:
+            logger.warning("Kanban /stop: board discovery failed", exc_info=True)
             boards = [{"slug": kb.DEFAULT_BOARD}]
+            total.failed.append("board discovery")
         seen: set[str] = set()
         for meta in boards:
             slug = meta.get("slug") or kb.DEFAULT_BOARD
@@ -549,7 +551,8 @@ class GatewaySlashCommandsMixin(
             try:
                 conn = kbc.connect(board=slug)
             except Exception:
-                logger.debug("Kanban /stop: cannot open board %s", slug, exc_info=True)
+                logger.warning("Kanban /stop: cannot open board %s", slug, exc_info=True)
+                total.failed.append(slug)
                 continue
             try:
                 part = kb.cancel_tasks_for_notify_source(
@@ -559,10 +562,11 @@ class GatewaySlashCommandsMixin(
                     thread_id=str(source.thread_id or ""),
                     reason="operator /stop",
                 )
-                for name in ("cancelled", "detached", "preserved", "orphaned", "workers_unverified"):
+                for name in ("cancelled", "detached", "preserved", "orphaned", "workers_unverified", "failed"):
                     getattr(total, name).extend(getattr(part, name))
             except Exception:
-                logger.debug("Kanban cancel on /stop failed for board %s", slug, exc_info=True)
+                logger.warning("Kanban cancel on /stop failed for board %s", slug, exc_info=True)
+                total.failed.append(slug)
             finally:
                 conn.close()
         return total
@@ -600,6 +604,7 @@ class GatewaySlashCommandsMixin(
             ("preserved", "gateway.stop.kanban_preserved", logging.INFO),
             ("orphaned", "gateway.stop.kanban_orphaned", logging.INFO),
             ("workers_unverified", "gateway.stop.kanban_unverified", logging.WARNING),
+            ("failed", "gateway.stop.kanban_failed", logging.WARNING),
         ):
             ids = list(getattr(result, attr, []) or [])
             if ids:

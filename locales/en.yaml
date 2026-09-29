@@ -457,6 +457,7 @@ gateway:
     kanban_preserved: "↪️ {count} follow-up task(s) report to a different conversation — left running."
     kanban_orphaned: "⏸️ {count} task(s) also depend on another live lane — parked as blocked until an operator decides."
     kanban_unverified: "⚠️ {count} task(s) were marked cancelled but their worker process could not be confirmed stopped — check `hermes kanban show <id>`."
+    kanban_failed: "⚠️ Kanban cancellation failed on {count} board/task(s) — some work may still be running. Check the board."
     kanban_pending: "⏳ Kanban cancellation is still running after {seconds}s and will finish in the background — check `hermes kanban list`."
   title:
     db_unavailable: "Session database not available."

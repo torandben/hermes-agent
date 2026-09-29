@@ -453,6 +453,7 @@ gateway:
     kanban_preserved: "↪️ Tuairiscíonn {count} tasc leantach do chomhrá eile — fanann siad ag rith."
     kanban_orphaned: "⏸️ Braitheann {count} tasc freisin ar lána beo eile — curtha i leataobh mar blocáilte go dtí go gcinnfidh oibreoir."
     kanban_unverified: "⚠️ Marcáladh {count} tasc mar cealaithe, ach níorbh fhéidir a dheimhniú gur stop a bpróiseas oibrí — seiceáil `hermes kanban show <id>`."
+    kanban_failed: "⚠️ Theip ar chealú Kanban ar {count} bord/tasc — d’fhéadfadh obair a bheith ar siúl fós. Seiceáil an bord."
     kanban_pending: "⏳ Tá cealú Kanban fós ar siúl tar éis {seconds}s agus críochnóidh sé sa chúlra — seiceáil `hermes kanban list`."
   title:
     db_unavailable: "Níl bunachar sonraí na seisiún ar fáil."

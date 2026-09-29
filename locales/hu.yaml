@@ -456,6 +456,7 @@ gateway:
     kanban_preserved: "↪️ {count} követő feladat egy másik beszélgetésnek jelent — tovább fut."
     kanban_orphaned: "⏸️ {count} feladat egy másik aktív sávtól is függ — blokkoltként parkolva, amíg egy operátor nem dönt."
     kanban_unverified: "⚠️ {count} feladat megszakítottként jelölve, de a munkafolyamat leállása nem igazolható — nézd meg: `hermes kanban show <id>`."
+    kanban_failed: "⚠️ A Kanban megszakítása {count} táblán/feladaton sikertelen — egyes munkák még futhatnak. Ellenőrizd a táblát."
     kanban_pending: "⏳ A Kanban-megszakítás {seconds} mp után is fut, és a háttérben fejeződik be — nézd meg: `hermes kanban list`."
   title:
     db_unavailable: "A munkamenet-adatbázis nem érhető el."

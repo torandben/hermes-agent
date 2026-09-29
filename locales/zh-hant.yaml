@@ -453,6 +453,7 @@ gateway:
     kanban_preserved: "↪️ {count} 個後續任務向其他對話回報 — 保持執行。"
     kanban_orphaned: "⏸️ {count} 個任務還依賴另一條仍在執行的工作線 — 已暫停為 blocked，等待操作員決定。"
     kanban_unverified: "⚠️ {count} 個任務已標記為取消，但無法確認其工作程序已停止 — 請查看 `hermes kanban show <id>`。"
+    kanban_failed: "⚠️ {count} 個看板／任務的 Kanban 取消失敗——部分工作可能仍在執行。請檢查看板。"
     kanban_pending: "⏳ Kanban 取消在 {seconds} 秒後仍在進行，將在背景完成 — 請查看 `hermes kanban list`。"
   title:
     db_unavailable: "工作階段資料庫無法使用。"

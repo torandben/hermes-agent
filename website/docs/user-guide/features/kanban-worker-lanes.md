@@ -136,7 +136,7 @@ kanban:
   allow_worker_child_tasks: false
 ```
 
-A worker with this set cannot create new cards: `kanban_create` is removed from its tool schema, and the handler refuses the call even if the model tries anyway. The worker still claims, heartbeats, comments, blocks, and completes its own card normally — it just cannot fan out more work.
+A worker with this set cannot create new cards: `kanban_create` is removed from its tool schema, its handler refuses the call even if the model tries anyway, and the `hermes kanban create` / `hermes kanban swarm` CLI commands refuse dispatcher-owned workers under the same policy. The worker still claims, heartbeats, comments, blocks, and completes its own card normally — it just cannot fan out more work.
 
 Use it on every specialist that should do one job and report back. Without it, a confused worker can spawn siblings that spawn siblings, and the board grows faster than you can read it.
 
@@ -160,7 +160,7 @@ Scoping is by notify subscription — the exact routing key results would be del
 | Task also subscribed to another thread/channel | **Left running.** Only this conversation unsubscribes |
 | Child task whose every parent is being cancelled | Cancelled too, deepest-first |
 | Child task another live lane still feeds (fan-in) | **Parked as `blocked`** with the reason, until an operator decides |
-| Child task that reports to a different conversation | Left running |
+| Child task that reports to a different conversation | Kept (never cancelled); if its parent was cancelled, parked as `blocked` and its own subscribers are notified |
 | Task already `done` / `archived` | Untouched |
 | Work in a sibling thread | Untouched |
 | A `/stop` typed in the channel, not the thread | Hits channel-level work only, not the thread's |
@@ -176,7 +176,7 @@ The reply distinguishes every outcome so you are never told "cancelled" about so
 ⚠️ 1 task(s) were marked cancelled but their worker process could not be confirmed stopped — check `hermes kanban show <id>`.
 ```
 
-The `⚠️` line appears when the worker was claimed by a different host, survived `SIGTERM` and `SIGKILL`, or was still being spawned when `/stop` arrived (the dispatcher kills that one itself as soon as it sees the claim is gone, but `/stop` cannot prove it from where it stands). The board row is terminal either way — it cannot be re-dispatched — but the OS process may still be alive, so check rather than assume.
+The `⚠️` line appears when the worker was claimed by a different host, survived `SIGTERM` and `SIGKILL`, or was still being spawned when `/stop` arrived (the dispatcher kills that one itself as soon as it sees the claim is gone, but `/stop` cannot prove it from where it stands). If a board cannot be opened or one task's cancellation fails, the reply also says `Kanban cancellation failed` and directs you to check the board instead of silently claiming all work stopped. The board row is terminal only for tasks actually cancelled; any task whose cancellation failed may still be dispatchable.
 
 Cancellation is bounded: if workers are slow to die, `/stop` replies after 20 seconds with `⏳ ... still running ... will finish in the background` instead of hanging.
 

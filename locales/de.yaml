@@ -453,6 +453,7 @@ gateway:
     kanban_preserved: "↪️ {count} Folgeaufgabe(n) berichten an eine andere Unterhaltung — laufen weiter."
     kanban_orphaned: "⏸️ {count} Aufgabe(n) hängen auch von einer anderen laufenden Spur ab — als blockiert geparkt, bis ein Operator entscheidet."
     kanban_unverified: "⚠️ {count} Aufgabe(n) wurden abgebrochen, aber das Beenden ihres Worker-Prozesses ließ sich nicht bestätigen — prüfen Sie `hermes kanban show <id>`."
+    kanban_failed: "⚠️ Kanban-Abbruch bei {count} Board(s)/Aufgabe(n) fehlgeschlagen — einige Arbeiten laufen möglicherweise weiter. Board prüfen."
     kanban_pending: "⏳ Der Kanban-Abbruch läuft nach {seconds}s noch und wird im Hintergrund abgeschlossen — prüfen Sie `hermes kanban list`."
   title:
     db_unavailable: "Sitzungsdatenbank nicht verfügbar."

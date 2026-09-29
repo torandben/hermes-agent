@@ -254,6 +254,30 @@ def test_descendant_shared_with_another_parent_survives(kanban_home):
         conn.close()
 
 
+def test_inherited_notify_subscription_does_not_cancel_fan_in(kanban_home):
+    """Normal create_task inherits the parent's subscription. A join still
+    belongs to the other live lane; it must not become an unconditional root."""
+    conn = kbc.connect()
+    try:
+        mine = kb.create_task(conn, title="mine", assignee="w")
+        theirs = kb.create_task(conn, title="theirs", assignee="w")
+        _sub(conn, mine)
+        join = kb.create_task(conn, title="join", assignee="w", parents=[mine, theirs])
+        assert any(s["chat_id"] == "chan1" for s in kbn.list_notify_subs(conn, join))
+
+        result = _cancel(conn)
+
+        assert result.cancelled == [mine]
+        assert join in result.orphaned
+        assert join not in result.cancelled
+        assert kb.get_task(conn, join).status == "blocked"
+        kb.archive_task(conn, theirs)
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, join).status == "blocked"
+    finally:
+        conn.close()
+
+
 def test_orphaned_fan_in_is_released_by_explicit_unblock(kanban_home):
     """The parked join is an operator decision, and unblocking it works once the
     operator removes the dead dependency."""
@@ -296,11 +320,15 @@ def test_descendant_reporting_elsewhere_is_never_cancelled(kanban_home):
         result = _cancel(conn, chat_id="chan1", thread_id="thr1")
 
         assert result.cancelled == [parent]
-        assert child in result.preserved
+        assert child in result.orphaned
+        assert child not in result.preserved
         assert kb.get_task(conn, child).status != "cancelled"
         # And the walk must not reach past it into that lane's own work.
         assert grandchild not in result.cancelled
         assert kb.get_task(conn, grandchild).status != "cancelled"
+        assert kb.get_task(conn, child).status == "blocked"
+        assert child in result.orphaned
+        assert child not in result.detached, "one outcome per task"
         # Nor may the preserved child become dispatchable off a cancelled parent.
         assert kb.get_task(conn, child).status != "ready"
     finally:
@@ -319,9 +347,10 @@ def test_descendant_shared_with_us_is_detached_not_cancelled(kanban_home):
 
         result = _cancel(conn, chat_id="chan1", thread_id="thr1")
 
-        assert child in result.detached
+        assert child in result.orphaned
+        assert child not in result.detached
         assert child not in result.cancelled
-        assert kb.get_task(conn, child).status != "cancelled"
+        assert kb.get_task(conn, child).status == "blocked"
         remaining = [
             (s["chat_id"], s["thread_id"])
             for s in kbn.list_notify_subs(conn, child)
@@ -652,7 +681,8 @@ def _cancelled_parent_with_preserved_child(conn):
     _sub(conn, parent, chat_id="chan1", thread_id="thr1")
     _sub(conn, child, chat_id="chanB", thread_id="thr9")
     result = _cancel(conn, chat_id="chan1", thread_id="thr1")
-    assert result.cancelled == [parent] and child in result.preserved
+    assert result.cancelled == [parent] and child in result.orphaned
+    assert kb.get_task(conn, child).status == "blocked"
     return parent, child
 
 

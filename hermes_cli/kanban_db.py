@@ -3972,6 +3972,7 @@ class CancelSourceResult:
     preserved: list[str] = field(default_factory=list)
     orphaned: list[str] = field(default_factory=list)
     workers_unverified: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)  # tasks/boards we could not safely cancel
 
 
 _SUB_MATCH_SQL = "LOWER(platform) = LOWER(?) AND chat_id = ? AND thread_id = ?"
@@ -4137,7 +4138,11 @@ def _cancel_one_task(
     verified = True
     pid, lock, started = prev
     if pid:
-        termination = _terminate_reclaimed_worker(pid, lock, signal_fn=signal_fn, started_at=started)
+        try:
+            termination = _terminate_reclaimed_worker(pid, lock, signal_fn=signal_fn, started_at=started)
+        except Exception as exc:
+            _log.warning("kanban cancel: task %s worker pid %s termination failed", task_id, pid, exc_info=True)
+            termination = {"host_local": None, "terminated": False, "error": str(exc)}
         if not termination.get("host_local"):
             _log.warning("kanban cancel: task %s worker pid %s is not host-local "
                          "(claim_lock=%s) — cannot terminate from this host", task_id, pid, lock)
@@ -4214,17 +4219,50 @@ def cancel_tasks_for_notify_source(
     def _foreign(task_id: str) -> bool:
         return _has_other_notify_subs(conn, task_id, source)
 
-    roots: list[str] = []
+    subscribed: list[str] = []
     for task_id in _notify_sub_scope_rows(conn, source):
         if _foreign(task_id):
             _detach_notify_sub(conn, task_id, source, reason=note)
             result.detached.append(task_id)
         else:
-            roots.append(task_id)
+            subscribed.append(task_id)
+
+    # A child normally inherits its parent's notify subscription. Being
+    # subscribed does not make a fan-in join an unconditional cancellation
+    # root: another live parent can still be feeding it. Grow roots only
+    # through tasks whose parents are already doomed or terminal, then let
+    # _cancellation_plan park any join with a live outside parent.
+    roots: list[str] = []
+    pending = set(subscribed)
+    changed = True
+    while changed:
+        changed = False
+        for task_id in subscribed:
+            if task_id not in pending:
+                continue
+            parents = conn.execute(
+                "SELECT t.id AS pid, t.status FROM task_links l "
+                "JOIN tasks t ON t.id = l.parent_id WHERE l.child_id = ?", (task_id,),
+            ).fetchall()
+            # A directly subscribed child may be stopped even while an
+            # out-of-scope parent runs. Only inherited descendants of another
+            # subscribed task need the fan-in check.
+            inherited = any(p["pid"] in subscribed for p in parents)
+            if not inherited or all(p["pid"] in roots or p["status"] in TERMINAL_STATUSES for p in parents):
+                roots.append(task_id)
+                pending.remove(task_id)
+                changed = True
     if not roots:
+        for task_id in subscribed:
+            _detach_notify_sub(conn, task_id, source, reason=note)
+            result.detached.append(task_id)
         return result
 
     doomed, foreign, orphaned = _cancellation_plan(conn, roots, is_foreign=_foreign)
+    for task_id in subscribed:
+        if task_id not in doomed:
+            _detach_notify_sub(conn, task_id, source, reason=note)
+            result.detached.append(task_id)
     for task_id in foreign:
         if _notify_sub_exists(conn, task_id, source):
             _detach_notify_sub(conn, task_id, source, reason=note)
@@ -4233,7 +4271,16 @@ def cancel_tasks_for_notify_source(
             result.preserved.append(task_id)
 
     for task_id in doomed:
-        verified = _cancel_one_task(conn, task_id, reason=note, signal_fn=signal_fn)
+        try:
+            verified = _cancel_one_task(conn, task_id, reason=note, signal_fn=signal_fn)
+        except Exception:
+            _log.warning("kanban cancel: task %s failed; other tasks will still be attempted", task_id, exc_info=True)
+            result.failed.append(task_id)
+            # The status may have committed before a later side effect failed.
+            # Never claim its worker is dead or discard its subscription.
+            if _task_status(conn, task_id) == "cancelled":
+                result.workers_unverified.append(task_id)
+            continue
         if verified is None:
             continue
         result.cancelled.append(task_id)
@@ -4245,10 +4292,14 @@ def cancel_tasks_for_notify_source(
                          (task_id, *source))
 
     cancelled = set(result.cancelled)
-    for task_id in orphaned:
+    for task_id in dict.fromkeys([*orphaned, *foreign]):
         dead = [r["parent_id"] for r in conn.execute(
             "SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,)) if r["parent_id"] in cancelled]
         if dead and _park_orphan(conn, task_id, cancelled_parents=dead, reason=note):
+            # A protected descendant may have been detached or preserved, but
+            # 'parked for operator input' is its one final /stop outcome.
+            result.detached = [tid for tid in result.detached if tid != task_id]
+            result.preserved = [tid for tid in result.preserved if tid != task_id]
             result.orphaned.append(task_id)
     return result
 

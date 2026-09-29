@@ -453,6 +453,7 @@ gateway:
     kanban_preserved: "↪️ {count} attività di follow-up riferiscono a un'altra conversazione — restano in esecuzione."
     kanban_orphaned: "⏸️ {count} attività dipendono anche da un'altra corsia attiva — parcheggiate come bloccate finché un operatore non decide."
     kanban_unverified: "⚠️ {count} attività sono state annullate, ma non è stato possibile confermare l'arresto del loro processo — controlla `hermes kanban show <id>`."
+    kanban_failed: "⚠️ Annullamento Kanban non riuscito per {count} bacheca/attività — alcune operazioni potrebbero essere ancora attive. Controlla la bacheca."
     kanban_pending: "⏳ L'annullamento Kanban è ancora in corso dopo {seconds}s e terminerà in background — controlla `hermes kanban list`."
   title:
     db_unavailable: "Database delle sessioni non disponibile."
