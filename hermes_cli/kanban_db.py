@@ -1072,6 +1072,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     user_id_alt   TEXT,
     chat_type     TEXT,
     notifier_profile TEXT,
+    subscription_origin TEXT,
     delivery_mode TEXT NOT NULL DEFAULT 'notify',
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
@@ -1496,10 +1497,10 @@ def _inherit_notify_subs(
         f"""
         INSERT OR IGNORE INTO kanban_notify_subs
             (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
-             chat_type, notifier_profile, delivery_mode, delivery_metadata,
+             chat_type, notifier_profile, subscription_origin, delivery_mode, delivery_metadata,
              created_at, last_event_id)
         SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
-               COALESCE(chat_type, 'dm'), notifier_profile,
+               COALESCE(chat_type, 'dm'), notifier_profile, 'inherited',
                COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
@@ -3975,7 +3976,10 @@ class CancelSourceResult:
     failed: list[str] = field(default_factory=list)  # tasks/boards we could not safely cancel
 
 
-_SUB_MATCH_SQL = "LOWER(platform) = LOWER(?) AND chat_id = ? AND thread_id = ?"
+_SUB_MATCH_SQL = (
+    "LOWER(platform) = LOWER(?) AND chat_id = ? AND thread_id = ? "
+    "AND COALESCE(NULLIF(notifier_profile, ''), 'default') = ?"
+)
 
 
 def _notify_sub_exists(conn: sqlite3.Connection, task_id: str, source: tuple) -> bool:
@@ -3993,7 +3997,7 @@ def _has_other_notify_subs(conn: sqlite3.Connection, task_id: str, source: tuple
     ).fetchone() is not None
 
 
-def _notify_sub_scope_rows(conn: sqlite3.Connection, source: tuple) -> list[str]:
+def _notify_sub_scope_rows(conn: sqlite3.Connection, source: tuple) -> dict[str, Optional[str]]:
     """Nonterminal task ids subscribed by exactly ``source``. Platform compares
     case-insensitively (as notifier routing does); chat and thread exactly, with
     the table's empty-string thread convention, so a channel-level ``/stop``
@@ -4001,15 +4005,15 @@ def _notify_sub_scope_rows(conn: sqlite3.Connection, source: tuple) -> list[str]
     placeholders = ",".join("?" * len(TERMINAL_STATUSES))
     rows = conn.execute(
         f"""
-        SELECT DISTINCT s.task_id AS task_id
+        SELECT s.task_id AS task_id, s.subscription_origin AS subscription_origin
           FROM kanban_notify_subs AS s JOIN tasks AS t ON t.id = s.task_id
-         WHERE LOWER(s.platform) = LOWER(?) AND s.chat_id = ? AND s.thread_id = ?
+         WHERE {_SUB_MATCH_SQL}
            AND t.status NOT IN ({placeholders})
          ORDER BY t.rowid
         """,
         (*source, *sorted(TERMINAL_STATUSES)),
     ).fetchall()
-    return [row["task_id"] for row in rows]
+    return {row["task_id"]: row["subscription_origin"] for row in rows}
 
 
 def _cancellation_plan(
@@ -4097,14 +4101,55 @@ def _leaves_first(conn: sqlite3.Connection, ids: set[str]) -> list[str]:
     return ordered
 
 
+def _cancellation_ancestor_guards(
+    conn: sqlite3.Connection, doomed: list[str], roots: list[str],
+) -> dict[str, tuple[str, ...]]:
+    """Return same-plan ancestors that must stay unshared before each cancel.
+
+    A direct root remains independently cancellable, even when an upstream
+    parent is shared. Every other planned task exists only through a root's
+    descendant closure, so a new foreign subscription on any ancestor in that
+    closure must stop the descendant's final status transition.
+    """
+    doomed_ids = set(doomed)
+    root_ids = set(roots)
+    guards: dict[str, tuple[str, ...]] = {}
+    for task_id in doomed:
+        if task_id in root_ids:
+            guards[task_id] = ()
+            continue
+        ancestors: set[str] = set()
+        frontier = [task_id]
+        while frontier:
+            child_id = frontier.pop()
+            for row in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?", (child_id,),
+            ):
+                parent_id = row["parent_id"]
+                if parent_id not in doomed_ids or parent_id in ancestors:
+                    continue
+                ancestors.add(parent_id)
+                if parent_id not in root_ids:
+                    frontier.append(parent_id)
+        guards[task_id] = tuple(sorted(ancestors))
+    return guards
+
+
+_CANCEL_DETACHED = object()
+
+
 def _cancel_one_task(
-    conn: sqlite3.Connection, task_id: str, *, reason: str, signal_fn=None,
-) -> Optional[bool]:
+    conn: sqlite3.Connection, task_id: str, *, source: Optional[tuple] = None,
+    ancestor_guards: tuple[str, ...] = (), reason: str, signal_fn=None,
+) -> Any:
     """Move one task to terminal ``cancelled``, then stop its worker.
 
-    ``None`` when it was already terminal; ``True`` when cancelled and no worker
-    outlived the call; ``False`` when cancelled but a worker could not be proven
-    dead.
+    ``None`` when it was already terminal; ``_CANCEL_DETACHED`` when a final
+    in-transaction subscription check found another source on this task or a
+    cancellation-plan ancestor (only run when a notify ``source`` is given;
+    without one the task is cancelled unconditionally); ``True`` when
+    cancelled and no worker outlived the call; ``False`` when cancelled but a
+    worker could not be proven dead.
 
     The status flip commits FIRST, so from that instant the dispatcher can
     neither claim nor promote the task. A worker the dispatcher spawned for this
@@ -4115,6 +4160,24 @@ def _cancel_one_task(
     unverified rather than as a clean stop.
     """
     with write_txn(conn):
+        shared_ancestor = next(
+            (ancestor_id for ancestor_id in ancestor_guards
+             if _has_other_notify_subs(conn, ancestor_id, source)),
+            None,
+        ) if source is not None else None
+        if source is not None and (
+            shared_ancestor is not None or _has_other_notify_subs(conn, task_id, source)
+        ):
+            conn.execute(
+                f"DELETE FROM kanban_notify_subs WHERE task_id = ? AND {_SUB_MATCH_SQL}",
+                (task_id, *source),
+            )
+            _append_event(conn, task_id, "notify_detached", {
+                "reason": reason, "platform": source[0], "chat_id": source[1],
+                "thread_id": source[2], "notifier_profile": source[3],
+                "shared_ancestor": shared_ancestor,
+            })
+            return _CANCEL_DETACHED
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
             (task_id,),
@@ -4167,7 +4230,8 @@ def _detach_notify_sub(conn: sqlite3.Connection, task_id: str, source: tuple, *,
         conn.execute(f"DELETE FROM kanban_notify_subs WHERE task_id = ? AND {_SUB_MATCH_SQL}",
                      (task_id, *source))
         _append_event(conn, task_id, "notify_detached", {
-            "reason": reason, "platform": source[0], "chat_id": source[1], "thread_id": source[2]})
+            "reason": reason, "platform": source[0], "chat_id": source[1],
+            "thread_id": source[2], "notifier_profile": source[3]})
 
 
 def _park_orphan(conn: sqlite3.Connection, task_id: str, *, cancelled_parents: list[str], reason: str) -> bool:
@@ -4192,7 +4256,8 @@ def _park_orphan(conn: sqlite3.Connection, task_id: str, *, cancelled_parents: l
 
 def cancel_tasks_for_notify_source(
     conn: sqlite3.Connection, *, platform: str, chat_id: str,
-    thread_id: Optional[str] = None, reason: Optional[str] = None, signal_fn=None,
+    thread_id: Optional[str] = None, notifier_profile: str = "default",
+    reason: Optional[str] = None, signal_fn=None,
 ) -> CancelSourceResult:
     """Stop the Kanban work routed back to one gateway conversation.
 
@@ -4212,9 +4277,10 @@ def cancel_tasks_for_notify_source(
        of silently waiting forever.
     3. **Status first, kill second** — see :func:`_cancel_one_task`.
     """
-    source = (platform, str(chat_id), thread_id or "")
+    source = (platform, str(chat_id), thread_id or "", notifier_profile or "default")
     note = reason or "cancelled by operator /stop"
     result = CancelSourceResult()
+    dynamically_detached: list[str] = []
 
     def _foreign(task_id: str) -> bool:
         return _has_other_notify_subs(conn, task_id, source)
@@ -4228,32 +4294,10 @@ def cancel_tasks_for_notify_source(
         else:
             subscribed.append(task_id)
 
-    # A child normally inherits its parent's notify subscription. Being
-    # subscribed does not make a fan-in join an unconditional cancellation
-    # root: another live parent can still be feeding it. Grow roots only
-    # through tasks whose parents are already doomed or terminal, then let
-    # _cancellation_plan park any join with a live outside parent.
-    roots: list[str] = []
-    pending = set(subscribed)
-    changed = True
-    while changed:
-        changed = False
-        for task_id in subscribed:
-            if task_id not in pending:
-                continue
-            parents = conn.execute(
-                "SELECT t.id AS pid, t.status FROM task_links l "
-                "JOIN tasks t ON t.id = l.parent_id WHERE l.child_id = ?", (task_id,),
-            ).fetchall()
-            # A directly subscribed child may be stopped even while an
-            # out-of-scope parent runs. But a child inherited from *any*
-            # subscribed parent is not independent — including a shared parent
-            # that was already detached above and therefore is not in roots.
-            inherited = any(p["pid"] in subscribed_scope for p in parents)
-            if not inherited or all(p["pid"] in roots or p["status"] in TERMINAL_STATUSES for p in parents):
-                roots.append(task_id)
-                pending.remove(task_id)
-                changed = True
+    # Only an explicitly direct subscription establishes an independent stop
+    # root. Inherited rows are reached through their direct ancestor's
+    # descendant closure; NULL is legacy/unknown provenance and fails closed.
+    roots = [task_id for task_id in subscribed if subscribed_scope[task_id] == "direct"]
     if not roots:
         for task_id in subscribed:
             _detach_notify_sub(conn, task_id, source, reason=note)
@@ -4261,6 +4305,7 @@ def cancel_tasks_for_notify_source(
         return result
 
     doomed, foreign, orphaned = _cancellation_plan(conn, roots, is_foreign=_foreign)
+    ancestor_guards = _cancellation_ancestor_guards(conn, doomed, roots)
     for task_id in subscribed:
         if task_id not in doomed:
             _detach_notify_sub(conn, task_id, source, reason=note)
@@ -4274,7 +4319,10 @@ def cancel_tasks_for_notify_source(
 
     for task_id in doomed:
         try:
-            verified = _cancel_one_task(conn, task_id, reason=note, signal_fn=signal_fn)
+            verified = _cancel_one_task(
+                conn, task_id, source=source, ancestor_guards=ancestor_guards[task_id],
+                reason=note, signal_fn=signal_fn,
+            )
         except Exception:
             _log.warning("kanban cancel: task %s failed; other tasks will still be attempted", task_id, exc_info=True)
             result.failed.append(task_id)
@@ -4285,6 +4333,10 @@ def cancel_tasks_for_notify_source(
             continue
         if verified is None:
             continue
+        if verified is _CANCEL_DETACHED:
+            result.detached.append(task_id)
+            dynamically_detached.append(task_id)
+            continue
         result.cancelled.append(task_id)
         if verified is False:
             result.workers_unverified.append(task_id)
@@ -4294,7 +4346,12 @@ def cancel_tasks_for_notify_source(
                          (task_id, *source))
 
     cancelled = set(result.cancelled)
-    for task_id in dict.fromkeys([*orphaned, *foreign]):
+    # A task can become shared only after planning, when _cancel_one_task's
+    # in-transaction recheck detaches it. It was absent from plan-time
+    # ``orphaned``/``foreign`` lists, but a directly cancelled parent still
+    # leaves it permanently dependency-blocked. Feed it through the same final
+    # direct-parent check; an ancestor cancellation alone does not park it.
+    for task_id in dict.fromkeys([*orphaned, *foreign, *dynamically_detached]):
         dead = [r["parent_id"] for r in conn.execute(
             "SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,)) if r["parent_id"] in cancelled]
         if dead and _park_orphan(conn, task_id, cancelled_parents=dead, reason=note):

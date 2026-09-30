@@ -40,7 +40,10 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _sub(conn, task_id, *, thread_id="thr1", chat_id="chan1", platform="discord"):
+def _sub(
+    conn, task_id, *, thread_id="thr1", chat_id="chan1", platform="discord",
+    notifier_profile="orchestrator",
+):
     kbn.add_notify_sub(
         conn,
         task_id=task_id,
@@ -48,7 +51,7 @@ def _sub(conn, task_id, *, thread_id="thr1", chat_id="chan1", platform="discord"
         chat_id=chat_id,
         thread_id=thread_id,
         user_id="userA",
-        notifier_profile="orchestrator",
+        notifier_profile=notifier_profile,
     )
 
 
@@ -56,7 +59,19 @@ def _cancel(conn, **kw):
     kw.setdefault("platform", "discord")
     kw.setdefault("chat_id", "chan1")
     kw.setdefault("thread_id", "thr1")
+    kw.setdefault("notifier_profile", "orchestrator")
     return kb.cancel_tasks_for_notify_source(conn, **kw)
+
+
+def _legacy_profile_duplicate(conn, task_id, notifier_profile):
+    """Legacy SQLite can contain a case-variant duplicate logical source."""
+    conn.execute(
+        "INSERT INTO kanban_notify_subs "
+        "(task_id, platform, chat_id, thread_id, notifier_profile, delivery_mode, created_at) "
+        "VALUES (?, 'DISCORD', 'chan1', 'thr1', ?, 'notify', 0)",
+        (task_id, notifier_profile),
+    )
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +150,58 @@ def test_cancel_returns_empty_for_unrelated_source(kanban_home):
         conn.close()
 
 
+def test_cancel_source_is_qualified_by_notifier_profile(kanban_home):
+    """A profile cannot cancel another profile's work through the same route."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="owned elsewhere", assignee="w")
+        _sub(conn, tid, notifier_profile="orchestrator")
+
+        result = _cancel(conn, notifier_profile="reviewer")
+
+        assert result.cancelled == []
+        assert result.detached == []
+        assert kb.get_task(conn, tid).status != "cancelled"
+        assert kbn.list_notify_subs(conn, tid)[0]["notifier_profile"] == "orchestrator"
+    finally:
+        conn.close()
+
+
+def test_legacy_unowned_subscription_matches_only_default_profile(kanban_home):
+    """Legacy NULL ownership is cancellable by default, never by named profiles."""
+    conn = kbc.connect()
+    try:
+        denied = kb.create_task(conn, title="legacy named", assignee="w")
+        allowed = kb.create_task(conn, title="legacy default", assignee="w")
+        _sub(conn, denied, notifier_profile=None)
+        _sub(conn, allowed, notifier_profile=None)
+
+        assert _cancel(conn, notifier_profile="orchestrator").cancelled == []
+        assert kb.get_task(conn, denied).status != "cancelled"
+        assert set(_cancel(conn, notifier_profile="default").cancelled) == {denied, allowed}
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("legacy_profile", [None, ""])
+def test_named_stop_preserves_task_with_legacy_default_subscriber(kanban_home, legacy_profile):
+    """NULL and empty profiles are default-owned other subscribers, never unknown SQL."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="legacy shared work", assignee="w")
+        _sub(conn, tid, notifier_profile="orchestrator")
+        _legacy_profile_duplicate(conn, tid, legacy_profile)
+
+        result = _cancel(conn, notifier_profile="orchestrator")
+
+        assert result.cancelled == []
+        assert result.detached == [tid]
+        assert kb.get_task(conn, tid).status != "cancelled"
+        assert [s["notifier_profile"] for s in kbn.list_notify_subs(conn, tid)] == [legacy_profile]
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Shared work: detach, never destroy (reviewed BLOCKER)
 # ---------------------------------------------------------------------------
@@ -162,6 +229,131 @@ def test_task_shared_with_another_conversation_is_detached_not_cancelled(kanban_
         # Only this conversation stopped listening; the other still gets results.
         remaining = kbn.list_notify_subs(conn, tid)
         assert [(s["chat_id"], s["thread_id"]) for s in remaining] == [("chanB", "thr9")]
+    finally:
+        conn.close()
+
+
+def test_new_subscriber_between_plan_and_status_flip_preserves_task(kanban_home, monkeypatch):
+    """The final shared-work check is serialized with the cancellation write."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="became shared", assignee="w")
+        _sub(conn, tid)
+        original = kb._cancel_one_task
+        inserted = False
+
+        def add_subscriber_then_cancel(*args, **kwargs):
+            nonlocal inserted
+            if not inserted:
+                inserted = True
+                other = kbc.connect()
+                try:
+                    _sub(other, tid, chat_id="chanB", thread_id="thr9")
+                finally:
+                    other.close()
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(kb, "_cancel_one_task", add_subscriber_then_cancel)
+
+        result = _cancel(conn)
+
+        assert result.cancelled == []
+        assert result.detached == [tid]
+        assert kb.get_task(conn, tid).status != "cancelled"
+        assert [(s["chat_id"], s["thread_id"]) for s in kbn.list_notify_subs(conn, tid)] == [
+            ("chanB", "thr9")
+        ]
+    finally:
+        conn.close()
+
+
+def test_new_parent_subscriber_after_plan_preserves_inherited_child(kanban_home, monkeypatch):
+    """A shared root discovered after planning protects its inherited child.
+
+    The hook runs only when the leaves-first cancellation loop reaches ``child``:
+    planning has already included both tasks, but the child's write transaction
+    has not started. The old per-task-only guard cancelled the child before it
+    reached the now-shared parent.
+    """
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="parent", assignee="w")
+        _sub(conn, parent)
+        child = kb.create_task(conn, title="inherited child", assignee="w", parents=[parent])
+        original = kb._cancel_one_task
+        inserted = False
+
+        def share_parent_before_child_cancel(cancel_conn, task_id, **kwargs):
+            nonlocal inserted
+            if task_id == child:
+                inserted = True
+                other = kbc.connect()
+                try:
+                    _sub(other, parent, chat_id="chanB", thread_id="thr9")
+                finally:
+                    other.close()
+            return original(cancel_conn, task_id, **kwargs)
+
+        monkeypatch.setattr(kb, "_cancel_one_task", share_parent_before_child_cancel)
+
+        result = _cancel(conn)
+
+        assert inserted is True
+        assert result.cancelled == []
+        assert kb.get_task(conn, parent).status != "cancelled"
+        assert kb.get_task(conn, child).status != "cancelled"
+        assert [(s["chat_id"], s["thread_id"]) for s in kbn.list_notify_subs(conn, parent)] == [
+            ("chanB", "thr9")
+        ]
+        assert kbn.list_notify_subs(conn, child) == []
+    finally:
+        conn.close()
+
+
+def test_dynamic_middle_detach_is_parked_after_its_parent_cancels(kanban_home, monkeypatch):
+    """A middle task detached by a stale ancestor guard cannot remain behind R.
+
+    The hook runs at L's leaves-first call after the plan is fixed and before
+    L's write transaction. M then becomes shared, causing L and M to detach;
+    R still cancels. M has R as its actually cancelled direct parent, so it is
+    sticky-blocked rather than silently left ``todo`` behind R.
+    """
+    conn = kbc.connect()
+    try:
+        root = kb.create_task(conn, title="root", assignee="w")
+        _sub(conn, root)
+        middle = kb.create_task(conn, title="middle", assignee="w", parents=[root])
+        leaf = kb.create_task(conn, title="leaf", assignee="w", parents=[middle])
+        original = kb._cancel_one_task
+        inserted = False
+
+        def share_middle_before_leaf_cancel(cancel_conn, task_id, **kwargs):
+            nonlocal inserted
+            if task_id == leaf:
+                inserted = True
+                other = kbc.connect()
+                try:
+                    _sub(other, middle, chat_id="chanB", thread_id="thr9")
+                finally:
+                    other.close()
+            return original(cancel_conn, task_id, **kwargs)
+
+        monkeypatch.setattr(kb, "_cancel_one_task", share_middle_before_leaf_cancel)
+
+        result = _cancel(conn)
+
+        assert inserted is True
+        assert result.cancelled == [root]
+        assert middle in result.orphaned
+        assert leaf in result.detached
+        assert kb.get_task(conn, root).status == "cancelled"
+        parked = kb.get_task(conn, middle)
+        assert parked.status == "blocked"
+        assert parked.block_kind == "needs_input"
+        assert kb.get_task(conn, leaf).status == "todo"
+        assert [(s["chat_id"], s["thread_id"]) for s in kbn.list_notify_subs(conn, middle)] == [
+            ("chanB", "thr9")
+        ]
     finally:
         conn.close()
 
@@ -296,6 +488,44 @@ def test_inherited_child_of_shared_parent_is_not_cancelled(kanban_home):
         assert child not in result.cancelled
         assert kb.get_task(conn, parent).status != "cancelled"
         assert kb.get_task(conn, child).status != "cancelled"
+    finally:
+        conn.close()
+
+
+def test_direct_child_remains_an_independent_cancel_root(kanban_home):
+    """An explicit child subscription is direct even when its parent shares the route."""
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="shared parent", assignee="w")
+        _sub(conn, parent)
+        child = kb.create_task(conn, title="direct child", assignee="w", parents=[parent])
+        _sub(conn, child)  # promote the inherited row to an explicit direct subscription
+        _sub(conn, parent, chat_id="chanB", thread_id="thr9")
+
+        result = _cancel(conn)
+
+        assert parent in result.detached
+        assert child in result.cancelled
+        assert kb.get_task(conn, parent).status != "cancelled"
+        assert kb.get_task(conn, child).status == "cancelled"
+    finally:
+        conn.close()
+
+
+def test_legacy_unknown_provenance_is_not_a_cancel_root(kanban_home):
+    """Unknown legacy provenance is conservatively inherited, never direct."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="legacy provenance", assignee="w")
+        _sub(conn, tid)
+        conn.execute("UPDATE kanban_notify_subs SET subscription_origin = NULL WHERE task_id = ?", (tid,))
+        conn.commit()
+
+        result = _cancel(conn)
+
+        assert result.cancelled == []
+        assert result.detached == [tid]
+        assert kb.get_task(conn, tid).status != "cancelled"
     finally:
         conn.close()
 
@@ -436,6 +666,7 @@ def test_cancel_terminates_running_worker_and_marks_terminal_first(kanban_home):
 
         result = kb.cancel_tasks_for_notify_source(
             conn, platform="discord", chat_id="chan1", thread_id="thr1",
+            notifier_profile="orchestrator",
             signal_fn=_fake_kill,
         )
 
@@ -469,6 +700,7 @@ def test_non_host_local_worker_is_reported_as_unverified(kanban_home):
         signalled = []
         result = kb.cancel_tasks_for_notify_source(
             conn, platform="discord", chat_id="chan1", thread_id="thr1",
+            notifier_profile="orchestrator",
             signal_fn=lambda pid, sig: signalled.append(pid),
         )
 
@@ -561,6 +793,7 @@ def test_worker_spawned_after_concurrent_cancel_is_terminated(kanban_home, all_a
             try:
                 observed["result"] = kb.cancel_tasks_for_notify_source(
                     other, platform="discord", chat_id="chan1", thread_id="thr1",
+                    notifier_profile="orchestrator",
                     signal_fn=lambda pid, sig: None)
             finally:
                 other.close()
@@ -697,7 +930,8 @@ def test_cancelled_task_can_be_hard_deleted(kanban_home):
 
 def _cancelled_parent_with_preserved_child(conn):
     """/stop cancels ``parent``; ``child`` reports elsewhere so it is preserved
-    in ``todo`` behind a parent that will never finish."""
+    behind a parent that will never finish. Explicitly unblock the child so the
+    delete path, rather than /stop's initial parking, must park it again."""
     parent = kb.create_task(conn, title="parent", assignee="w")
     child = kb.create_task(conn, title="child", assignee="w", parents=[parent])
     _sub(conn, parent, chat_id="chan1", thread_id="thr1")
@@ -705,6 +939,12 @@ def _cancelled_parent_with_preserved_child(conn):
     result = _cancel(conn, chat_id="chan1", thread_id="thr1")
     assert result.cancelled == [parent] and child in result.orphaned
     assert kb.get_task(conn, child).status == "blocked"
+    assert kb.unblock_task(conn, child) is True
+    assert kb.get_task(conn, child).status == "todo"
+    assert conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+        (parent, child),
+    ).fetchone() is not None
     return parent, child
 
 
@@ -725,7 +965,8 @@ def test_deleting_cancelled_parent_does_not_release_child(kanban_home, delete):
         assert task.status == "blocked", "must not become dispatchable"
         assert task.block_kind == "needs_input", "sticky: only an operator releases it"
         reasons = [e.payload.get("reason", "") for e in kb.list_events(conn, child) if e.kind == "blocked"]
-        assert any(parent in r for r in reasons), reasons
+        assert f"dependency cancelled and deleted: {parent}" in reasons
+        assert kb.claim_task(conn, child, claimer=kb._claimer_id()) is None
     finally:
         conn.close()
 

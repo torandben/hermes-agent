@@ -46,6 +46,13 @@ class _KanbanCancelPending:
     """/stop's reply was sent before the Kanban cancellation finished."""
 
 
+@dataclasses.dataclass
+class _KanbanCancelFailure:
+    """Kanban cancellation could not be attempted safely."""
+
+    failed: list[str]
+
+
 def _log_late_kanban_cancel(fut) -> None:
     """Record the eventual result of a cancel that outlived /stop's reply."""
     try:
@@ -526,14 +533,14 @@ class GatewaySlashCommandsMixin(
             if not is_truthy_value(cfg_get(load_config(), "kanban", "cancel_on_stop", default=False)):
                 return None
         except Exception:
-            logger.debug("Kanban cancel-on-stop config read failed", exc_info=True)
-            return None
+            logger.warning("Kanban cancel-on-stop config read failed", exc_info=True)
+            return _KanbanCancelFailure(failed=["configuration"])
         try:
             from hermes_cli import kanban_db as kb
             from hermes_cli import kanban_db_connect as kbc
         except Exception:
-            logger.debug("Kanban unavailable for /stop", exc_info=True)
-            return None
+            logger.warning("Kanban unavailable for /stop", exc_info=True)
+            return _KanbanCancelFailure(failed=["setup"])
         total = kb.CancelSourceResult()
         try:
             boards = kb.list_boards(include_archived=False) or [{"slug": kb.DEFAULT_BOARD}]
@@ -560,6 +567,7 @@ class GatewaySlashCommandsMixin(
                     platform=source.platform.value if source.platform else "",
                     chat_id=str(source.chat_id or ""),
                     thread_id=str(source.thread_id or ""),
+                    notifier_profile=(getattr(source, "profile", None) or self._active_profile_name() or "default"),
                     reason="operator /stop",
                 )
                 for name in ("cancelled", "detached", "preserved", "orphaned", "workers_unverified", "failed"):

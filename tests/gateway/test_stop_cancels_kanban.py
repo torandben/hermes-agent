@@ -97,6 +97,7 @@ class _FakeStore:
 def _source(uid="userA", thread_id="thr1", chat_id="chan1"):
     return SessionSource(
         platform=Platform.DISCORD,
+        profile="orchestrator",
         chat_type="forum",
         chat_id=chat_id,
         thread_id=thread_id,
@@ -227,6 +228,46 @@ async def test_nothing_to_cancel_keeps_the_plain_reply(hermes_home):
     text = await _stop(runner, source)
 
     assert text.strip() == "No active task to stop."
+
+
+@pytest.mark.asyncio
+async def test_config_load_failure_is_reported_as_unconfirmed(hermes_home, monkeypatch):
+    """A broken config is not indistinguishable from an intentional opt-out."""
+    import hermes_cli.config as config_module
+
+    runner, source = _runner(running=False)
+
+    def fail_config():
+        raise RuntimeError("unreadable config")
+
+    monkeypatch.setattr(config_module, "load_config", fail_config)
+
+    text = await _stop(runner, source)
+
+    assert text.strip() != "No active task to stop."
+    assert "Kanban" in text and ("confirm" in text.lower() or "failed" in text.lower())
+
+
+@pytest.mark.asyncio
+async def test_kanban_import_failure_is_reported_as_unconfirmed(hermes_home, monkeypatch):
+    """Unavailable Kanban code is a failed safety check, not a disabled feature."""
+    import builtins
+
+    _enable_cancel_on_stop(hermes_home)
+    runner, source = _runner(running=False)
+    real_import = builtins.__import__
+
+    def fail_kanban_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "hermes_cli" and "kanban_db" in fromlist:
+            raise ImportError("kanban unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fail_kanban_import)
+
+    text = await _stop(runner, source)
+
+    assert text.strip() != "No active task to stop."
+    assert "Kanban" in text and ("confirm" in text.lower() or "failed" in text.lower())
 
 
 # ---------------------------------------------------------------------------

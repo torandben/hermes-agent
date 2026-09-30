@@ -111,9 +111,9 @@ def add_notify_sub(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
-                 chat_type, notifier_profile, delivery_mode, delivery_metadata,
+                 chat_type, notifier_profile, subscription_origin, delivery_mode, delivery_metadata,
                  created_at, last_event_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'direct', ?, ?, ?,
                     COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
             """,
             (
@@ -131,6 +131,7 @@ def add_notify_sub(
             ("notifier_profile", notifier_profile, True),
             ("delivery_mode", valid_mode, False),
             ("delivery_metadata", metadata_json, False),
+            ("subscription_origin", "direct", False),
         ):
             if not value:
                 continue
